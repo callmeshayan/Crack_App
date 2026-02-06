@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+.venv/
+.venv311/
+venv/
+ENV/
+env/
+
+# Environment variables
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+Icon
+
+# Project specific
+data/
+outputs_batch/
+outputs_model/
+images/
+images_batch/
+
+# Temporary files
+*.tmp
+*.log
+*.cache
