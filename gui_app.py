@@ -39,15 +39,15 @@ client = InferenceHTTPClient(
 
 # ================== SETTINGS ==================
 try:
-    CONF_THRESH = float(os.getenv("RF_CONF", "0.4"))  # Lower default for faster detection
+    CONF_THRESH = float(os.getenv("RF_CONF", "0.3"))  # Very low for maximum sensitivity
     if not 0.0 <= CONF_THRESH <= 1.0:
         raise ValueError("RF_CONF must be between 0.0 and 1.0")
     
-    INFER_FPS = float(os.getenv("RF_INFER_FPS", "5.0"))  # Increased from 2.0 to 5.0
+    INFER_FPS = float(os.getenv("RF_INFER_FPS", "10.0"))  # Maximum practical speed
     if INFER_FPS <= 0:
         raise ValueError("RF_INFER_FPS must be positive")
     
-    SAVE_COOLDOWN_S = float(os.getenv("RF_SAVE_COOLDOWN", "0.2"))  # Reduced from 0.5
+    SAVE_COOLDOWN_S = float(os.getenv("RF_SAVE_COOLDOWN", "0.1"))  # Minimal delay
     if SAVE_COOLDOWN_S < 0:
         raise ValueError("RF_SAVE_COOLDOWN must be non-negative")
     
