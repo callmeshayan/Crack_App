@@ -1,8 +1,11 @@
 import os
 import time
 import json
+import signal
+import platform
 import threading
 import tempfile
+import traceback
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -35,15 +38,29 @@ client = InferenceHTTPClient(
 )
 
 # ================== SETTINGS ==================
-CONF_THRESH = float(os.getenv("RF_CONF", "0.5"))
-INFER_FPS = float(os.getenv("RF_INFER_FPS", "2.0"))
-SAVE_COOLDOWN_S = float(os.getenv("RF_SAVE_COOLDOWN", "0.5"))
+try:
+    CONF_THRESH = float(os.getenv("RF_CONF", "0.5"))
+    if not 0.0 <= CONF_THRESH <= 1.0:
+        raise ValueError("RF_CONF must be between 0.0 and 1.0")
+    
+    INFER_FPS = float(os.getenv("RF_INFER_FPS", "2.0"))
+    if INFER_FPS <= 0:
+        raise ValueError("RF_INFER_FPS must be positive")
+    
+    SAVE_COOLDOWN_S = float(os.getenv("RF_SAVE_COOLDOWN", "0.5"))
+    if SAVE_COOLDOWN_S < 0:
+        raise ValueError("RF_SAVE_COOLDOWN must be non-negative")
+    
+    SMALL_MAX = float(os.getenv("RF_SMALL_MAX_PX2", "6000"))
+    MEDIUM_MAX = float(os.getenv("RF_MEDIUM_MAX_PX2", "20000"))
+    if SMALL_MAX >= MEDIUM_MAX:
+        raise ValueError("RF_SMALL_MAX_PX2 must be less than RF_MEDIUM_MAX_PX2")
+except ValueError as e:
+    raise ValueError(f"Invalid configuration: {e}")
+
 ONLY_CLASS = os.getenv("RF_ONLY_CLASS", "crack").strip()  # "" disables
 SHOW_PREVIEW = os.getenv("RF_SHOW_PREVIEW", "1").strip() != "0"
-
-# size thresholds in px^2
-SMALL_MAX = float(os.getenv("RF_SMALL_MAX_PX2", "6000"))
-MEDIUM_MAX = float(os.getenv("RF_MEDIUM_MAX_PX2", "20000"))
+SAVE_TO_ALL_DIRS = os.getenv("RF_SAVE_TO_ALL_DIRS", "1").strip() == "1"
 
 # save ONLY found
 OUT_BASE = Path("data/realtime_results")
@@ -82,90 +99,6 @@ def update_marker_state():
 # ================== HELPERS ==================
 def stamp() -> str:
     return time.strftime("%Y%m%d_%H%M%S")
-
-def get_bbox_from_pred(p: Dict[str, Any]) -> tuple:
-    """Extract bounding box coordinates from prediction."""
-    x = float(p.get("x", 0.0))
-    y = float(p.get("y", 0.0))
-    w = float(p.get("width", 0.0))
-    h = float(p.get("height", 0.0))
-    
-    x1 = int(x - w / 2)
-    y1 = int(y - h / 2)
-    x2 = int(x + w / 2)
-    y2 = int(y + h / 2)
-    
-    return (x1, y1, x2, y2, w, h)
-
-def draw_predictions_on_frame(frame, preds: List[Dict[str, Any]]) -> Any:
-    """Draw bounding boxes and labels on frame."""
-    marked_frame = frame.copy()
-    
-    for p in preds:
-        x1, y1, x2, y2, w, h = get_bbox_from_pred(p)
-        conf = pred_conf(p)
-        cls = pred_class(p)
-        area = w * h
-        
-        # Determine color based on size
-        if area < SMALL_MAX:
-            color = (0, 255, 255)  # Yellow for small
-            size_label = "SMALL"
-        elif area < MEDIUM_MAX:
-            color = (0, 165, 255)  # Orange for medium
-            size_label = "MEDIUM"
-        else:
-            color = (0, 0, 255)  # Red for large
-            size_label = "LARGE"
-        
-        # Draw bounding box
-        cv2.rectangle(marked_frame, (x1, y1), (x2, y2), color, 2)
-        
-        # Draw label with confidence and size
-        label = f"{cls} {conf:.2f} [{size_label}]"
-        (label_w, label_h), baseline = cv2.getTextSize(
-            label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2
-        )
-        
-        # Draw background rectangle for text
-        cv2.rectangle(
-            marked_frame,
-            (x1, y1 - label_h - baseline - 5),
-            (x1 + label_w, y1),
-            color,
-            -1
-        )
-        
-        # Draw text
-        cv2.putText(
-            marked_frame,
-            label,
-            (x1, y1 - baseline - 2),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            (255, 255, 255),
-            2
-        )
-    
-    return marked_frame
-
-def categorize_by_size(preds: List[Dict[str, Any]]) -> str:
-    """Determine size category based on largest crack."""
-    if not preds:
-        return "none"
-    
-    max_area = 0
-    for p in preds:
-        _, _, _, _, w, h = get_bbox_from_pred(p)
-        area = w * h
-        max_area = max(max_area, area)
-    
-    if max_area < SMALL_MAX:
-        return "small"
-    elif max_area < MEDIUM_MAX:
-        return "medium"
-    else:
-        return "large"
 
 def pred_conf(p: Dict[str, Any]) -> float:
     return float(p.get("confidence", p.get("score", 0.0)) or 0.0)
@@ -397,13 +330,7 @@ def inference_loop():
 
             annotated = draw_markings(frame, preds)
 
-            # Save to found directories
-            for d in (FOUND_DIR, REALTIME_FOUND_DIR):
-                cv2.imwrite(str(d / f"{name}_marked.jpg"), annotated)
-                cv2.imwrite(str(d / f"{name}_original.jpg"), frame)
-                (d / f"{name}.json").write_text(json.dumps(result, indent=2))
-            
-            # Save to size-categorized directory
+            # Determine size-categorized directory
             if bucket_frame == "S":
                 size_dir = SMALL_DIR
             elif bucket_frame == "M":
@@ -411,24 +338,61 @@ def inference_loop():
             else:
                 size_dir = LARGE_DIR
             
+            # Primary save to size-categorized directory
             cv2.imwrite(str(size_dir / f"{name}_marked.jpg"), annotated)
             cv2.imwrite(str(size_dir / f"{name}_original.jpg"), frame)
             (size_dir / f"{name}.json").write_text(json.dumps(result, indent=2))
+            
+            # Optional: Save to additional directories if configured
+            if SAVE_TO_ALL_DIRS:
+                for d in (FOUND_DIR, REALTIME_FOUND_DIR):
+                    cv2.imwrite(str(d / f"{name}_marked.jpg"), annotated)
+                    cv2.imwrite(str(d / f"{name}_original.jpg"), frame)
+                    (d / f"{name}.json").write_text(json.dumps(result, indent=2))
 
-        except Exception:
+        except Exception as e:
+            error_msg = f"Inference error: {str(e)[:100]}"
+            print(error_msg)
+            traceback.print_exc()
             with latest_status_lock:
                 latest_status["status"] = "error"
                 latest_status["count"] = 0
                 latest_status["best"] = 0.0
-            time.sleep(0.05)
+            time.sleep(0.5)  # Back off on error
 
 # ================== MAIN ==================
+def signal_handler(sig, frame):
+    """Handle Ctrl+C gracefully."""
+    global stop_flag
+    print("\n[INFO] Shutting down gracefully...")
+    stop_flag = True
+
 def main():
     global latest_frame, stop_flag
-
-    cap = cv2.VideoCapture(0, cv2.CAP_AVFOUNDATION)
+    
+    # Register signal handler for graceful shutdown
+    signal.signal(signal.SIGINT, signal_handler)
+    
+    # Cross-platform camera initialization with fallback
+    print("[INFO] Initializing camera...")
+    cap = None
+    
+    # Try without backend first (most compatible)
+    cap = cv2.VideoCapture(0)
     if not cap.isOpened():
-        raise RuntimeError("Camera not available")
+        print("[WARN] Default backend failed, trying platform-specific backend...")
+        # Platform-specific backends
+        if platform.system() == "Darwin":  # macOS
+            cap = cv2.VideoCapture(0, cv2.CAP_AVFOUNDATION)
+        elif platform.system() == "Linux":
+            cap = cv2.VideoCapture(0, cv2.CAP_V4L2)
+        else:  # Windows
+            cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+    
+    if not cap or not cap.isOpened():
+        raise RuntimeError("Camera not available. Check permissions and connections.")
+    
+    print(f"[INFO] Camera opened successfully. Backend: {cap.getBackendName()}")
 
     worker = threading.Thread(target=inference_loop, daemon=True)
     worker.start()
