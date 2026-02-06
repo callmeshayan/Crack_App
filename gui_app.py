@@ -39,15 +39,15 @@ client = InferenceHTTPClient(
 
 # ================== SETTINGS ==================
 try:
-    CONF_THRESH = float(os.getenv("RF_CONF", "0.5"))
+    CONF_THRESH = float(os.getenv("RF_CONF", "0.4"))  # Lower default for faster detection
     if not 0.0 <= CONF_THRESH <= 1.0:
         raise ValueError("RF_CONF must be between 0.0 and 1.0")
     
-    INFER_FPS = float(os.getenv("RF_INFER_FPS", "2.0"))
+    INFER_FPS = float(os.getenv("RF_INFER_FPS", "5.0"))  # Increased from 2.0 to 5.0
     if INFER_FPS <= 0:
         raise ValueError("RF_INFER_FPS must be positive")
     
-    SAVE_COOLDOWN_S = float(os.getenv("RF_SAVE_COOLDOWN", "0.5"))
+    SAVE_COOLDOWN_S = float(os.getenv("RF_SAVE_COOLDOWN", "0.2"))  # Reduced from 0.5
     if SAVE_COOLDOWN_S < 0:
         raise ValueError("RF_SAVE_COOLDOWN must be non-negative")
     
@@ -396,6 +396,8 @@ def main():
 
     worker = threading.Thread(target=inference_loop, daemon=True)
     worker.start()
+    
+    window_name = "realtime"
 
     while True:
         ok, frame = cap.read()
@@ -419,7 +421,13 @@ def main():
             cv2.putText(frame, overlay, (15, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
-            cv2.imshow("realtime", frame)
+            cv2.imshow(window_name, frame)
+            
+            # Check if window was closed by clicking X button
+            if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
+                break
+            
+            # Check for ESC key
             if cv2.waitKey(1) & 0xFF == 27:
                 break
 

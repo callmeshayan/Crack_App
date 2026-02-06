@@ -16,16 +16,16 @@ class Detection:
     box: Tuple[int, int, int, int]  # (x1, y1, x2, y2) in pixels
 
 
-class RoboflowClient:
+class RFClient:
     def __init__(self):
-        api_url = "https://serverless.roboflow.com"
-        self.api_key = os.getenv("ROBOFLOW_API_KEY", "").strip()
-        self.base_url = os.getenv("ROBOFLOW_URL", "").strip().rstrip("/")
-        self.conf = float(os.getenv("ROBOFLOW_CONF", "0.25"))
+        api_url = "https://serverless.RF.com"
+        self.api_key = os.getenv("RF_API_KEY", "").strip()
+        self.base_url = os.getenv("RF_URL", "").strip().rstrip("/")
+        self.conf = float(os.getenv("RF_CONF", "0.25"))
 
         if not self.api_key or not self.base_url:
             raise ValueError(
-                "Missing ROBOFLOW_API_KEY or ROBOFLOW_URL in .env"
+                "Missing RF_API_KEY or RF_URL in .env"
             )
 
         # Final endpoint
@@ -57,7 +57,7 @@ class RoboflowClient:
             if only_class and cls.lower() != only_class.lower():
                 continue
 
-            # Roboflow commonly returns center x/y and width/height in pixels
+            # RF commonly returns center x/y and width/height in pixels
             x = float(p.get("x", 0.0))
             y = float(p.get("y", 0.0))
             w = float(p.get("width", 0.0))
