@@ -4,54 +4,168 @@ import json
 import threading
 import tempfile
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
+import numpy as np
 from dotenv import load_dotenv
 from inference_sdk import InferenceHTTPClient
 
-from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QImage, QPixmap
-from PySide6.QtWidgets import (
-    QApplication, QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
-    QDoubleSpinBox, QFormLayout, QMessageBox
-)
+# ---- optional but REQUIRED for rle_mask decoding ----
+try:
+    from pycocotools import mask as mask_utils
+    HAS_PYCOCOTOOLS = True
+except Exception:
+    HAS_PYCOCOTOOLS = False
 
-# -------- ENV --------
+
+# ================== ENV ==================
 load_dotenv(Path(__file__).resolve().parent / ".env", override=True)
+
 API_KEY = os.getenv("RF_API_KEY", "").strip()
 WORKSPACE = os.getenv("RF_WORKSPACE", "").strip()
 WORKFLOW_ID = os.getenv("RF_WORKFLOW_ID", "").strip()
+
 if not API_KEY or not WORKSPACE or not WORKFLOW_ID:
     raise ValueError("Missing .env vars: RF_API_KEY, RF_WORKSPACE, RF_WORKFLOW_ID")
 
-client = InferenceHTTPClient("https://serverless.roboflow.com", API_KEY)
+client = InferenceHTTPClient(
+    api_url="https://serverless.roboflow.com",
+    api_key=API_KEY,
+)
 
+# ================== SETTINGS ==================
+CONF_THRESH = float(os.getenv("RF_CONF", "0.5"))
+INFER_FPS = float(os.getenv("RF_INFER_FPS", "2.0"))
+SAVE_COOLDOWN_S = float(os.getenv("RF_SAVE_COOLDOWN", "0.5"))
+ONLY_CLASS = os.getenv("RF_ONLY_CLASS", "crack").strip()  # "" disables
+SHOW_PREVIEW = os.getenv("RF_SHOW_PREVIEW", "1").strip() != "0"
+
+# size thresholds in px^2
+SMALL_MAX = float(os.getenv("RF_SMALL_MAX_PX2", "6000"))
+MEDIUM_MAX = float(os.getenv("RF_MEDIUM_MAX_PX2", "20000"))
+
+# save ONLY found
 OUT_BASE = Path("data/realtime_results")
 FOUND_DIR = OUT_BASE / "found"
 NOT_FOUND_DIR = OUT_BASE / "not_found"
 REALTIME_FOUND_DIR = OUT_BASE / "realtime_found"
-for d in (FOUND_DIR, NOT_FOUND_DIR, REALTIME_FOUND_DIR):
+
+# Size-based categorization directories
+SMALL_DIR = OUT_BASE / "small_cracks"
+MEDIUM_DIR = OUT_BASE / "medium_cracks"
+LARGE_DIR = OUT_BASE / "large_cracks"
+
+for d in (FOUND_DIR, NOT_FOUND_DIR, REALTIME_FOUND_DIR, SMALL_DIR, MEDIUM_DIR, LARGE_DIR):
     d.mkdir(parents=True, exist_ok=True)
 
-ONLY_CLASS = "crack"
+# ================== MARKER (1s pulse boolean) ==================
+marker_active = False
+marker_until = 0.0
+marker_lock = threading.Lock()
 
-def extract_predictions(result: Any) -> List[Dict[str, Any]]:
-    if isinstance(result, list):
-        for item in result:
-            preds = extract_predictions(item)
-            if preds:
-                return preds
-        return []
-    if isinstance(result, dict):
-        preds = result.get("predictions")
-        if isinstance(preds, list):
-            return preds
-        for v in result.values():
-            preds = extract_predictions(v)
-            if preds:
-                return preds
-    return []
+def trigger_marker_pulse(duration_s: float = 1.0):
+    global marker_active, marker_until
+    now = time.time()
+    with marker_lock:
+        if not marker_active:
+            marker_active = True
+            marker_until = now + duration_s
+
+def update_marker_state():
+    global marker_active
+    now = time.time()
+    with marker_lock:
+        if marker_active and now >= marker_until:
+            marker_active = False
+
+# ================== HELPERS ==================
+def stamp() -> str:
+    return time.strftime("%Y%m%d_%H%M%S")
+
+def get_bbox_from_pred(p: Dict[str, Any]) -> tuple:
+    """Extract bounding box coordinates from prediction."""
+    x = float(p.get("x", 0.0))
+    y = float(p.get("y", 0.0))
+    w = float(p.get("width", 0.0))
+    h = float(p.get("height", 0.0))
+    
+    x1 = int(x - w / 2)
+    y1 = int(y - h / 2)
+    x2 = int(x + w / 2)
+    y2 = int(y + h / 2)
+    
+    return (x1, y1, x2, y2, w, h)
+
+def draw_predictions_on_frame(frame, preds: List[Dict[str, Any]]) -> Any:
+    """Draw bounding boxes and labels on frame."""
+    marked_frame = frame.copy()
+    
+    for p in preds:
+        x1, y1, x2, y2, w, h = get_bbox_from_pred(p)
+        conf = pred_conf(p)
+        cls = pred_class(p)
+        area = w * h
+        
+        # Determine color based on size
+        if area < SMALL_MAX:
+            color = (0, 255, 255)  # Yellow for small
+            size_label = "SMALL"
+        elif area < MEDIUM_MAX:
+            color = (0, 165, 255)  # Orange for medium
+            size_label = "MEDIUM"
+        else:
+            color = (0, 0, 255)  # Red for large
+            size_label = "LARGE"
+        
+        # Draw bounding box
+        cv2.rectangle(marked_frame, (x1, y1), (x2, y2), color, 2)
+        
+        # Draw label with confidence and size
+        label = f"{cls} {conf:.2f} [{size_label}]"
+        (label_w, label_h), baseline = cv2.getTextSize(
+            label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2
+        )
+        
+        # Draw background rectangle for text
+        cv2.rectangle(
+            marked_frame,
+            (x1, y1 - label_h - baseline - 5),
+            (x1 + label_w, y1),
+            color,
+            -1
+        )
+        
+        # Draw text
+        cv2.putText(
+            marked_frame,
+            label,
+            (x1, y1 - baseline - 2),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (255, 255, 255),
+            2
+        )
+    
+    return marked_frame
+
+def categorize_by_size(preds: List[Dict[str, Any]]) -> str:
+    """Determine size category based on largest crack."""
+    if not preds:
+        return "none"
+    
+    max_area = 0
+    for p in preds:
+        _, _, _, _, w, h = get_bbox_from_pred(p)
+        area = w * h
+        max_area = max(max_area, area)
+    
+    if max_area < SMALL_MAX:
+        return "small"
+    elif max_area < MEDIUM_MAX:
+        return "medium"
+    else:
+        return "large"
 
 def pred_conf(p: Dict[str, Any]) -> float:
     return float(p.get("confidence", p.get("score", 0.0)) or 0.0)
@@ -59,216 +173,295 @@ def pred_conf(p: Dict[str, Any]) -> float:
 def pred_class(p: Dict[str, Any]) -> str:
     return str(p.get("class", p.get("class_name", p.get("label", ""))) or "")
 
-def stamp() -> str:
-    return time.strftime("%Y%m%d_%H%M%S")
+def extract_predictions(result: Any) -> List[Dict[str, Any]]:
+    """
+    Your workflow returns a list with one dict:
+      { "predictions": { "image":..., "predictions":[...] }, "visualization": ... }
+    This function returns the inner list under any nested 'predictions'.
+    """
+    if isinstance(result, list):
+        for item in result:
+            preds = extract_predictions(item)
+            if preds:
+                return preds
+        return []
 
-class App(QWidget):
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("Crack Realtime Controller")
+    if isinstance(result, dict):
+        v = result.get("predictions")
+        if isinstance(v, list):
+            return v
+        if isinstance(v, dict) and isinstance(v.get("predictions"), list):
+            return v["predictions"]
 
-        # state
-        self.cap = None
-        self.running = False
-        self.stop_flag = False
+        for vv in result.values():
+            preds = extract_predictions(vv)
+            if preds:
+                return preds
 
-        self.latest_frame = None
-        self.latest_frame_lock = threading.Lock()
+    return []
 
-        self.latest_status = ("idle", 0, 0.0)  # status, dets, best
-        self.latest_status_lock = threading.Lock()
+def filter_preds(preds: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out = []
+    for p in preds:
+        if pred_conf(p) < CONF_THRESH:
+            continue
+        if ONLY_CLASS and pred_class(p).lower() != ONLY_CLASS.lower():
+            continue
+        out.append(p)
+    return out
 
-        # controls
-        self.btn_start = QPushButton("Start")
-        self.btn_stop = QPushButton("Stop")
-        self.btn_stop.setEnabled(False)
+def bbox_xyxy(p: Dict[str, Any]) -> Optional[Tuple[int, int, int, int]]:
+    if all(k in p for k in ("x1", "y1", "x2", "y2")):
+        x1, y1, x2, y2 = int(p["x1"]), int(p["y1"]), int(p["x2"]), int(p["y2"])
+        if x2 < x1: x1, x2 = x2, x1
+        if y2 < y1: y1, y2 = y2, y1
+        return x1, y1, x2, y2
+    if all(k in p for k in ("x", "y", "width", "height")):
+        x, y = float(p["x"]), float(p["y"])
+        w, h = float(p["width"]), float(p["height"])
+        x1 = int(round(x - w / 2))
+        y1 = int(round(y - h / 2))
+        x2 = int(round(x + w / 2))
+        y2 = int(round(y + h / 2))
+        if x2 < x1: x1, x2 = x2, x1
+        if y2 < y1: y1, y2 = y2, y1
+        return x1, y1, x2, y2
+    return None
 
-        self.conf_spin = QDoubleSpinBox()
-        self.conf_spin.setRange(0.0, 1.0)
-        self.conf_spin.setSingleStep(0.05)
-        self.conf_spin.setValue(float(os.getenv("RF_CONF", "0.5")))
+def decode_rle_mask_to_binary(p: Dict[str, Any]) -> Optional[np.ndarray]:
+    """
+    Returns binary mask (H,W) uint8 0/255 if rle_mask exists and pycocotools is installed.
+    """
+    if not HAS_PYCOCOTOOLS:
+        return None
+    rm = p.get("rle_mask")
+    if not isinstance(rm, dict) or "size" not in rm or "counts" not in rm:
+        return None
+    try:
+        m = mask_utils.decode(rm)  # shape (H,W,1) or (H,W)
+        if m.ndim == 3:
+            m = m[:, :, 0]
+        return (m.astype(np.uint8) * 255)
+    except Exception:
+        return None
 
-        self.fps_spin = QDoubleSpinBox()
-        self.fps_spin.setRange(0.1, 10.0)
-        self.fps_spin.setSingleStep(0.5)
-        self.fps_spin.setValue(2.0)
+def mask_area_px2(mask_u8: np.ndarray) -> float:
+    return float(cv2.countNonZero(mask_u8))
 
-        self.cooldown_spin = QDoubleSpinBox()
-        self.cooldown_spin.setRange(0.0, 10.0)
-        self.cooldown_spin.setSingleStep(0.1)
-        self.cooldown_spin.setValue(0.5)
+def pred_area_px2(p: Dict[str, Any]) -> float:
+    m = decode_rle_mask_to_binary(p)
+    if m is not None:
+        return mask_area_px2(m)
+    box = bbox_xyxy(p)
+    if box is not None:
+        x1, y1, x2, y2 = box
+        return float(max(0, x2 - x1) * max(0, y2 - y1))
+    return 0.0
 
-        # preview + status
-        self.preview = QLabel("Preview")
-        self.preview.setAlignment(Qt.AlignCenter)
-        self.preview.setFixedSize(960, 540)
+def size_bucket(area_px2: float) -> str:
+    if area_px2 <= SMALL_MAX:
+        return "S"
+    if area_px2 <= MEDIUM_MAX:
+        return "M"
+    return "L"
 
-        self.status_lbl = QLabel("idle | dets=0 | best=0.00")
+def size_color_bgr(bucket: str) -> Tuple[int, int, int]:
+    if bucket == "S":
+        return (0, 255, 0)       # green
+    if bucket == "M":
+        return (0, 255, 255)     # yellow
+    return (0, 0, 255)           # red
 
-        # layout
-        form = QFormLayout()
-        form.addRow("Confidence threshold", self.conf_spin)
-        form.addRow("Inference FPS", self.fps_spin)
-        form.addRow("Save cooldown (s)", self.cooldown_spin)
+def draw_markings(img_bgr: np.ndarray, preds: List[Dict[str, Any]]) -> np.ndarray:
+    """
+    Draw segmentation outlines when rle_mask exists; otherwise draw bbox.
+    Color is based on crack size bucket.
+    """
+    h, w = img_bgr.shape[:2]
+    out = img_bgr.copy()
 
-        btns = QHBoxLayout()
-        btns.addWidget(self.btn_start)
-        btns.addWidget(self.btn_stop)
+    for p in preds:
+        conf = pred_conf(p)
+        cls = pred_class(p) or "crack"
 
-        root = QVBoxLayout()
-        root.addLayout(form)
-        root.addLayout(btns)
-        root.addWidget(self.status_lbl)
-        root.addWidget(self.preview)
-        self.setLayout(root)
+        area = pred_area_px2(p)
+        bucket = size_bucket(area)
+        color = size_color_bgr(bucket)
 
-        # signals
-        self.btn_start.clicked.connect(self.start)
-        self.btn_stop.clicked.connect(self.stop)
+        mask_u8 = decode_rle_mask_to_binary(p)
+        if mask_u8 is not None:
+            # find contours on mask and draw outline
+            contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            for c in contours:
+                if len(c) >= 3:
+                    cv2.polylines(out, [c], isClosed=True, color=color, thickness=2)
 
-        # UI timer to refresh preview
-        self.timer = QTimer(self)
-        self.timer.timeout.connect(self.refresh_ui)
-        self.timer.start(33)  # ~30 FPS UI refresh
+            # label near largest contour bbox
+            if contours:
+                cmax = max(contours, key=cv2.contourArea)
+                x, y, ww, hh = cv2.boundingRect(cmax)
+                label = f"{cls} {conf:.2f} {bucket}"
+                cv2.putText(out, label, (x, max(20, y - 8)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+            continue
 
-    def start(self):
-        if self.running:
-            return
-        self.cap = cv2.VideoCapture(0, cv2.CAP_AVFOUNDATION)
-        if not self.cap.isOpened():
-            QMessageBox.critical(self, "Camera", "Camera not available. Check macOS Camera permissions.")
-            return
+        # fallback: bbox
+        box = bbox_xyxy(p)
+        if box is not None:
+            x1, y1, x2, y2 = box
+            x1 = max(0, min(w - 1, x1)); x2 = max(0, min(w - 1, x2))
+            y1 = max(0, min(h - 1, y1)); y2 = max(0, min(h - 1, y2))
+            cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
+            label = f"{cls} {conf:.2f} {bucket}"
+            cv2.putText(out, label, (x1, max(20, y1 - 8)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
-        self.stop_flag = False
-        self.running = True
-        self.btn_start.setEnabled(False)
-        self.btn_stop.setEnabled(True)
+    return out
 
-        self.capture_thread = threading.Thread(target=self.capture_loop, daemon=True)
-        self.infer_thread = threading.Thread(target=self.infer_loop, daemon=True)
-        self.capture_thread.start()
-        self.infer_thread.start()
+def largest_area(preds: List[Dict[str, Any]]) -> float:
+    return max((pred_area_px2(p) for p in preds), default=0.0)
 
-    def stop(self):
-        if not self.running:
-            return
-        self.stop_flag = True
-        self.running = False
+# ================== SHARED STATE ==================
+latest_frame = None
+latest_frame_lock = threading.Lock()
 
-        if self.cap:
-            self.cap.release()
-            self.cap = None
+latest_status = {"status": "idle", "count": 0, "best": 0.0}
+latest_status_lock = threading.Lock()
 
-        self.btn_start.setEnabled(True)
-        self.btn_stop.setEnabled(False)
+stop_flag = False
 
-    def capture_loop(self):
-        while not self.stop_flag and self.cap:
-            ok, frame = self.cap.read()
-            if not ok:
-                time.sleep(0.01)
-                continue
-            with self.latest_frame_lock:
-                self.latest_frame = frame
+# ================== INFERENCE THREAD ==================
+def inference_loop():
+    global stop_flag
 
-    def infer_loop(self):
-        last_infer = 0.0
-        last_saved_found = 0.0
-        last_saved_nf = 0.0
+    min_interval = 1.0 / max(INFER_FPS, 0.1)
+    last_infer = 0.0
+    last_saved = 0.0
 
-        while not self.stop_flag:
-            infer_fps = float(self.fps_spin.value())
-            min_interval = 1.0 / max(infer_fps, 0.1)
+    while not stop_flag:
+        now = time.time()
+        if now - last_infer < min_interval:
+            time.sleep(0.01)
+            continue
 
-            now = time.time()
-            if now - last_infer < min_interval:
-                time.sleep(0.01)
-                continue
-
-            with self.latest_frame_lock:
-                frame = None if self.latest_frame is None else self.latest_frame.copy()
-            if frame is None:
-                time.sleep(0.01)
-                continue
-
-            last_infer = now
-
-            ok, jpg = cv2.imencode(".jpg", frame)
-            if not ok:
-                continue
-
-            try:
-                with tempfile.NamedTemporaryFile(suffix=".jpg", delete=True) as f:
-                    f.write(jpg.tobytes())
-                    f.flush()
-                    result = client.run_workflow(
-                        workspace_name=WORKSPACE,
-                        workflow_id=WORKFLOW_ID,
-                        images={"image": f.name},
-                        use_cache=True
-                    )
-
-                preds = extract_predictions(result)
-
-                conf_thr = float(self.conf_spin.value())
-                preds = [
-                    p for p in preds
-                    if pred_conf(p) >= conf_thr and (not ONLY_CLASS or pred_class(p).lower() == ONLY_CLASS.lower())
-                ]
-
-                best = max((pred_conf(p) for p in preds), default=0.0)
-                count = len(preds)
-                found = count > 0
-
-                with self.latest_status_lock:
-                    self.latest_status = ("found" if found else "not_found", count, best)
-
-                cooldown = float(self.cooldown_spin.value())
-                t = time.time()
-                name = f"{stamp()}_{int(t*1000)}"
-
-                if found and (t - last_saved_found) >= cooldown:
-                    last_saved_found = t
-                    for d in (FOUND_DIR, REALTIME_FOUND_DIR):
-                        base = d / name
-                        cv2.imwrite(str(base) + ".jpg", frame)
-                        Path(str(base) + ".json").write_text(json.dumps(result, indent=2))
-
-                if (not found) and (t - last_saved_nf) >= cooldown:
-                    last_saved_nf = t
-                    base = NOT_FOUND_DIR / name
-                    cv2.imwrite(str(base) + ".jpg", frame)
-                    Path(str(base) + ".json").write_text(json.dumps(result, indent=2))
-
-            except Exception:
-                with self.latest_status_lock:
-                    self.latest_status = ("error", 0, 0.0)
-                time.sleep(0.05)
-
-    def refresh_ui(self):
-        # update status
-        with self.latest_status_lock:
-            st, count, best = self.latest_status
-        self.status_lbl.setText(f"{st} | dets={count} | best={best:.2f}")
-
-        # update preview
-        with self.latest_frame_lock:
-            frame = None if self.latest_frame is None else self.latest_frame.copy()
+        with latest_frame_lock:
+            frame = None if latest_frame is None else latest_frame.copy()
         if frame is None:
-            return
+            continue
 
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        h, w, ch = frame_rgb.shape
-        qimg = QImage(frame_rgb.data, w, h, ch * w, QImage.Format_RGB888)
-        pix = QPixmap.fromImage(qimg).scaled(self.preview.width(), self.preview.height(), Qt.KeepAspectRatio)
-        self.preview.setPixmap(pix)
+        last_infer = now
 
-    def closeEvent(self, event):
-        self.stop()
-        event.accept()
+        ok, jpg = cv2.imencode(".jpg", frame)
+        if not ok:
+            continue
+
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".jpg", delete=True) as f:
+                f.write(jpg.tobytes())
+                f.flush()
+                result = client.run_workflow(
+                    workspace_name=WORKSPACE,
+                    workflow_id=WORKFLOW_ID,
+                    images={"image": f.name},
+                    use_cache=True
+                )
+
+            preds = filter_preds(extract_predictions(result))
+            count = len(preds)
+            best = max((pred_conf(p) for p in preds), default=0.0)
+            found = count > 0
+
+            if found:
+                trigger_marker_pulse(1.0)
+            update_marker_state()
+
+            with latest_status_lock:
+                latest_status["status"] = "found" if found else "not_found"
+                latest_status["count"] = count
+                latest_status["best"] = best
+
+            # discard not found
+            if not found:
+                continue
+
+            # cooldown for saving
+            t = time.time()
+            if (t - last_saved) < SAVE_COOLDOWN_S:
+                continue
+            last_saved = t
+
+            # name by largest crack size in frame
+            area_frame = largest_area(preds)
+            bucket_frame = size_bucket(area_frame)
+            name = f"{bucket_frame}_{int(area_frame)}px2_{stamp()}_{int(t*1000)}"
+
+            annotated = draw_markings(frame, preds)
+
+            # Save to found directories
+            for d in (FOUND_DIR, REALTIME_FOUND_DIR):
+                cv2.imwrite(str(d / f"{name}_marked.jpg"), annotated)
+                cv2.imwrite(str(d / f"{name}_original.jpg"), frame)
+                (d / f"{name}.json").write_text(json.dumps(result, indent=2))
+            
+            # Save to size-categorized directory
+            if bucket_frame == "S":
+                size_dir = SMALL_DIR
+            elif bucket_frame == "M":
+                size_dir = MEDIUM_DIR
+            else:
+                size_dir = LARGE_DIR
+            
+            cv2.imwrite(str(size_dir / f"{name}_marked.jpg"), annotated)
+            cv2.imwrite(str(size_dir / f"{name}_original.jpg"), frame)
+            (size_dir / f"{name}.json").write_text(json.dumps(result, indent=2))
+
+        except Exception:
+            with latest_status_lock:
+                latest_status["status"] = "error"
+                latest_status["count"] = 0
+                latest_status["best"] = 0.0
+            time.sleep(0.05)
+
+# ================== MAIN ==================
+def main():
+    global latest_frame, stop_flag
+
+    cap = cv2.VideoCapture(0, cv2.CAP_AVFOUNDATION)
+    if not cap.isOpened():
+        raise RuntimeError("Camera not available")
+
+    worker = threading.Thread(target=inference_loop, daemon=True)
+    worker.start()
+
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+
+        with latest_frame_lock:
+            latest_frame = frame
+
+        if SHOW_PREVIEW:
+            with latest_status_lock:
+                st = latest_status["status"]
+                c = latest_status["count"]
+                b = latest_status["best"]
+
+            with marker_lock:
+                m = marker_active
+
+            warn = "" if HAS_PYCOCOTOOLS else " | NO pycocotools (no mask outlines)"
+            overlay = f"{st} | dets={c} | best={b:.2f} | MARKER={'ON' if m else 'OFF'}{warn}"
+            cv2.putText(frame, overlay, (15, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+            cv2.imshow("realtime", frame)
+            if cv2.waitKey(1) & 0xFF == 27:
+                break
+
+    stop_flag = True
+    cap.release()
+    cv2.destroyAllWindows()
 
 if __name__ == "__main__":
-    app = QApplication([])
-    w = App()
-    w.show()
-    app.exec()
+    main()
