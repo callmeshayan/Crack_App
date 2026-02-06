@@ -4,3 +4,4 @@ inference-sdk>=0.9.0
 PySide6>=6.5.0
 numpy>=1.24.0
 requests>=2.31.0
+flask>=3.0.0

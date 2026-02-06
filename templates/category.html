@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+
+{% block title %}{{ title }} - Crack Detection Reports{% endblock %}
+
+{% block content %}
+<h1 class="my-4">
+    {{ title }}
+    <span class="badge badge-size bg-{{ badge_class }}">{{ detections|length }} detections</span>
+</h1>
+
+{% if detections %}
+<div class="row">
+    {% for detection in detections %}
+    <div class="col-md-4 mb-4">
+        <div class="card detection-card">
+            {% if detection.marked_image %}
+            <a href="/detection/{{ category }}/{{ detection.id }}">
+                <img src="/images/{{ category }}/{{ detection.marked_image }}" 
+                     class="card-img-top" alt="Detection">
+            </a>
+            {% endif %}
+            <div class="card-body">
+                <h5 class="card-title">
+                    Detection #{{ loop.index }}
+                </h5>
+                <p class="card-text">
+                    <small class="text-muted">
+                        <strong>Area:</strong> {{ detection.area_px2 }} px²<br>
+                        <strong>Time:</strong> {{ detection.timestamp }}
+                    </small>
+                </p>
+                <div class="d-flex justify-content-between">
+                    <a href="/detection/{{ category }}/{{ detection.id }}" 
+                       class="btn btn-sm btn-primary">View Details</a>
+                    {% if detection.marked_image %}
+                    <a href="/images/{{ category }}/{{ detection.marked_image }}" 
+                       class="btn btn-sm btn-secondary" download>Download</a>
+                    {% endif %}
+                </div>
+            </div>
+        </div>
+    </div>
+    {% endfor %}
+</div>
+{% else %}
+<div class="alert alert-info">
+    <p class="mb-0">No {{ title|lower }} detected yet.</p>
+</div>
+{% endif %}
+
+{% endblock %}

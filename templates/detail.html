@@ -1,0 +1,73 @@
+{% extends "base.html" %}
+
+{% block title %}Detection Details{% endblock %}
+
+{% block content %}
+<div class="my-4">
+    <a href="/category/{{ detection.category }}" class="btn btn-secondary mb-3">
+        ← Back to {{ detection.category|capitalize }} Cracks
+    </a>
+</div>
+
+<h1 class="my-4">Detection Details</h1>
+
+<div class="row">
+    <!-- Images -->
+    <div class="col-md-8">
+        <div class="card mb-4">
+            <div class="card-header">
+                <h5>Marked Image (with detections)</h5>
+            </div>
+            <div class="card-body text-center">
+                {% if detection.marked_image %}
+                <img src="/images/{{ detection.category }}/{{ detection.marked_image }}" 
+                     class="img-fluid rounded" alt="Marked">
+                {% else %}
+                <p class="text-muted">No marked image available</p>
+                {% endif %}
+            </div>
+        </div>
+
+        <div class="card mb-4">
+            <div class="card-header">
+                <h5>Original Image</h5>
+            </div>
+            <div class="card-body text-center">
+                {% if detection.original_image %}
+                <img src="/images/{{ detection.category }}/{{ detection.original_image }}" 
+                     class="img-fluid rounded" alt="Original">
+                {% else %}
+                <p class="text-muted">No original image available</p>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+
+    <!-- Metadata -->
+    <div class="col-md-4">
+        <div class="card mb-4">
+            <div class="card-header">
+                <h5>Detection Information</h5>
+            </div>
+            <div class="card-body">
+                <p><strong>ID:</strong> {{ detection.id }}</p>
+                <p><strong>Category:</strong> 
+                    <span class="badge {% if detection.category == 'small' %}bg-success{% elif detection.category == 'medium' %}bg-warning{% else %}bg-danger{% endif %}">
+                        {{ detection.category|capitalize }}
+                    </span>
+                </p>
+            </div>
+        </div>
+
+        <div class="card">
+            <div class="card-header">
+                <h5>Raw Data (JSON)</h5>
+            </div>
+            <div class="card-body">
+                <pre class="bg-light p-3 rounded" style="max-height: 400px; overflow-y: auto; font-size: 0.85em;">{{ detection.data | tojson(indent=2) }}</pre>
+            </div>
+        </div>
+    </div>
+</div>
+
+{% endblock %}

@@ -1,0 +1,86 @@
+{% extends "base.html" %}
+
+{% block title %}Dashboard - Crack Detection Reports{% endblock %}
+
+{% block content %}
+<h1 class="my-4">📊 Dashboard</h1>
+
+<!-- Statistics Cards -->
+<div class="row mb-4">
+    <div class="col-md-3">
+        <div class="card stat-card text-center border-primary">
+            <div class="card-body">
+                <h5 class="card-title text-primary">Total Detections</h5>
+                <h2 class="display-4">{{ stats.total }}</h2>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-3">
+        <div class="card stat-card text-center border-success">
+            <div class="card-body">
+                <h5 class="card-title text-success">Small Cracks</h5>
+                <h2 class="display-4">{{ stats.small }}</h2>
+                <a href="/category/small" class="btn btn-sm btn-success">View</a>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-3">
+        <div class="card stat-card text-center border-warning">
+            <div class="card-body">
+                <h5 class="card-title text-warning">Medium Cracks</h5>
+                <h2 class="display-4">{{ stats.medium }}</h2>
+                <a href="/category/medium" class="btn btn-sm btn-warning">View</a>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-3">
+        <div class="card stat-card text-center border-danger">
+            <div class="card-body">
+                <h5 class="card-title text-danger">Large Cracks</h5>
+                <h2 class="display-4">{{ stats.large }}</h2>
+                <a href="/category/large" class="btn btn-sm btn-danger">View</a>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Recent Detections -->
+<h2 class="my-4">🕐 Recent Detections</h2>
+
+{% if recent %}
+<div class="row">
+    {% for detection in recent %}
+    <div class="col-md-4 mb-4">
+        <div class="card detection-card">
+            {% if detection.marked_image %}
+            <a href="/detection/{{ detection.size_bucket|lower }}/{{ detection.id }}">
+                <img src="/images/{{ detection.size_bucket|lower }}/{{ detection.marked_image }}" 
+                     class="card-img-top" alt="Detection">
+            </a>
+            {% endif %}
+            <div class="card-body">
+                <h5 class="card-title">
+                    <span class="badge badge-size {% if detection.size_bucket == 'S' %}bg-success{% elif detection.size_bucket == 'M' %}bg-warning{% else %}bg-danger{% endif %}">
+                        {% if detection.size_bucket == 'S' %}Small{% elif detection.size_bucket == 'M' %}Medium{% else %}Large{% endif %}
+                    </span>
+                </h5>
+                <p class="card-text">
+                    <small class="text-muted">
+                        <strong>Area:</strong> {{ detection.area_px2 }} px²<br>
+                        <strong>Time:</strong> {{ detection.timestamp }}
+                    </small>
+                </p>
+                <a href="/detection/{{ detection.size_bucket|lower }}/{{ detection.id }}" 
+                   class="btn btn-sm btn-primary">View Details</a>
+            </div>
+        </div>
+    </div>
+    {% endfor %}
+</div>
+{% else %}
+<div class="alert alert-info">
+    <p class="mb-0">No detections yet. Run the detection app to start finding cracks!</p>
+</div>
+{% endif %}
+
+{% endblock %}
