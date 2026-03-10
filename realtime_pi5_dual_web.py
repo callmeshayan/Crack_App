@@ -5,6 +5,7 @@ Raspberry Pi 5 Dual CSI Camera Real-time Crack Detection with Flask Web Streamin
 """
 
 import os
+import csv
 import time
 import json
 import threading
@@ -53,6 +54,24 @@ SEVERITY_MEDIUM = 0.55
 
 BOOLEAN_DURATION_S = 1.0
 
+# ---------- PIPELINE LOCALIZATION SETTINGS ----------
+# IMPORTANT: These settings enable crack position estimation for live inspection
+# Position is estimated based on elapsed time assuming constant robot speed
+
+# Set your pipeline length in meters
+PIPELINE_LENGTH_METERS = 100.0  # Change to your actual pipeline length
+
+# Set estimated inspection duration in seconds (time to traverse full pipeline)
+# Example: If robot takes 10 minutes to inspect 100m pipe, set to 600.0
+ESTIMATED_INSPECTION_DURATION_SEC = 600.0  # Change based on your robot speed
+
+# Alternative: If you know robot speed, calculate duration:
+# ROBOT_SPEED_MPS = 0.167  # meters per second (e.g., 10 m/min = 0.167 m/s)
+# ESTIMATED_INSPECTION_DURATION_SEC = PIPELINE_LENGTH_METERS / ROBOT_SPEED_MPS
+
+# Enable/disable position tracking
+ENABLE_POSITION_TRACKING = True
+
 CAMERA_WIDTH = 640
 CAMERA_HEIGHT = 480
 CAPTURE_FPS = 30
@@ -70,14 +89,46 @@ FOUND_DIR_CAM0 = OUT_BASE / "camera0_found"
 FOUND_DIR_CAM1 = OUT_BASE / "camera1_found"
 REALTIME_FOUND_DIR_CAM0 = OUT_BASE / "camera0_realtime"
 REALTIME_FOUND_DIR_CAM1 = OUT_BASE / "camera1_realtime"
+REPORTS_DIR = OUT_BASE / "reports"
 
-for p in [FOUND_DIR_CAM0, FOUND_DIR_CAM1, REALTIME_FOUND_DIR_CAM0, REALTIME_FOUND_DIR_CAM1]:
+for p in [FOUND_DIR_CAM0, FOUND_DIR_CAM1, REALTIME_FOUND_DIR_CAM0, REALTIME_FOUND_DIR_CAM1, REPORTS_DIR]:
     p.mkdir(parents=True, exist_ok=True)
 
 
 # ---------------- HELPERS ----------------
 def stamp() -> str:
     return time.strftime("%Y%m%d_%H%M%S")
+
+
+def estimate_crack_position(elapsed_sec: float, estimated_duration_sec: float, pipeline_length_m: float) -> float:
+    """
+    Estimate crack position along the pipeline based on elapsed time.
+    
+    IMPORTANT: This is an APPROXIMATE estimate assuming constant robot speed.
+    The actual position may vary if the robot speed changes during inspection.
+    
+    Formula: position_m = pipeline_length_m * (elapsed_time / total_inspection_time)
+    
+    Args:
+        elapsed_sec: Time elapsed since inspection start (seconds)
+        estimated_duration_sec: Expected total inspection duration (seconds)
+        pipeline_length_m: Total pipeline length in meters
+    
+    Returns:
+        Estimated position in meters from pipe entrance
+    """
+    if not ENABLE_POSITION_TRACKING or estimated_duration_sec <= 0:
+        return 0.0
+    
+    # Clamp elapsed time to valid range
+    elapsed_sec = max(0.0, min(elapsed_sec, estimated_duration_sec))
+    
+    # Proportional calculation based on time progress
+    # Estimated crack location from pipe entrance
+    # position_m = pipeline_length_m * (elapsed_time / total_inspection_time)
+    position_m = pipeline_length_m * (elapsed_sec / estimated_duration_sec)
+    
+    return position_m
 
 
 def extract_predictions(result: Any) -> List[Dict[str, Any]]:
@@ -152,7 +203,8 @@ def classify_severity(confidence: float) -> str:
     return "LOW"
 
 
-def draw_detections(frame: np.ndarray, preds: List[Dict[str, Any]]) -> np.ndarray:
+def draw_detections(frame: np.ndarray, preds: List[Dict[str, Any]], position_m: float = 0.0) -> np.ndarray:
+    """Draw detections with optional position information"""
     for pred in preds:
         x = int(pred.get("x", 0))
         y = int(pred.get("y", 0))
@@ -179,7 +231,10 @@ def draw_detections(frame: np.ndarray, preds: List[Dict[str, Any]]) -> np.ndarra
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
 
         area = calculate_crack_area(pred)
-        label = f"{pred_class(pred)} [{severity}] {conf:.2f} ({int(area)}px)"
+        if ENABLE_POSITION_TRACKING and position_m > 0:
+            label = f"Crack at {position_m:.2f}m [{severity}] {conf:.2f}"
+        else:
+            label = f"{pred_class(pred)} [{severity}] {conf:.2f} ({int(area)}px)"
         (tw, th_text), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
         cv2.rectangle(frame, (x1, y1 - th_text - 10), (x1 + tw, y1), color, -1)
         cv2.putText(frame, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
@@ -208,6 +263,25 @@ class CameraState:
         self.boolean_on = False
         self.boolean_until = 0.0
         self.boolean_lock = threading.Lock()
+
+        # Position tracking
+        self.start_time = time.time()
+        self.crack_counter = 0
+        self.position_lock = threading.Lock()
+        
+        # CSV report file
+        if ENABLE_POSITION_TRACKING:
+            csv_filename = REPORTS_DIR / f"cam{camera_id}_crack_report_{stamp()}.csv"
+            self.csv_file = open(csv_filename, 'w', newline='')
+            self.csv_writer = csv.writer(self.csv_file)
+            self.csv_writer.writerow([
+                "crack_id", "elapsed_sec", "position_m", "confidence", 
+                "severity", "area_px", "class", "image_name", "timestamp"
+            ])
+            self.csv_lock = threading.Lock()
+        else:
+            self.csv_file = None
+            self.csv_writer = None
 
         self.stats = {
             "total_frames": 0,
@@ -247,6 +321,41 @@ class CameraState:
             if self.boolean_on and time.time() > self.boolean_until:
                 self.boolean_on = False
             return self.boolean_on
+    
+    def get_elapsed_time(self) -> float:
+        """Get time elapsed since inspection start"""
+        return time.time() - self.start_time
+    
+    def get_estimated_position(self) -> float:
+        """Get current estimated position in pipeline"""
+        if not ENABLE_POSITION_TRACKING:
+            return 0.0
+        elapsed = self.get_elapsed_time()
+        return estimate_crack_position(elapsed, ESTIMATED_INSPECTION_DURATION_SEC, PIPELINE_LENGTH_METERS)
+    
+    def increment_crack_counter(self) -> int:
+        """Increment and return crack counter"""
+        with self.position_lock:
+            self.crack_counter += 1
+            return self.crack_counter
+    
+    def write_crack_to_csv(self, crack_id: int, elapsed_sec: float, position_m: float, 
+                           conf: float, severity: str, area: float, class_name: str, 
+                           image_name: str, timestamp: float):
+        """Write crack detection to CSV report"""
+        if self.csv_writer is not None:
+            with self.csv_lock:
+                self.csv_writer.writerow([
+                    crack_id, f"{elapsed_sec:.2f}", f"{position_m:.2f}", 
+                    f"{conf:.3f}", severity, int(area), class_name, 
+                    image_name, timestamp
+                ])
+                self.csv_file.flush()
+    
+    def close_csv(self):
+        """Close CSV file"""
+        if self.csv_file is not None:
+            self.csv_file.close()
 
 
 # ---------------- CAPTURE (rpicam pipe) ----------------
@@ -345,8 +454,14 @@ def inference_loop(cam_state: CameraState):
                 cam_state.latest_result["status"] = "blurry"
                 cam_state.latest_result["blur_score"] = blur_score
             
+            elapsed = cam_state.get_elapsed_time()
+            position_m = cam_state.get_estimated_position()
+            
             display_frame = frame.copy()
-            cv2.putText(display_frame, f"CAM{cam_state.camera_id} | BLURRY (blur={blur_score:.1f})",
+            status_text = f"CAM{cam_state.camera_id} | BLURRY (blur={blur_score:.1f})"
+            if ENABLE_POSITION_TRACKING:
+                status_text += f" | Pos: {position_m:.2f}m"
+            cv2.putText(display_frame, status_text,
                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
             with cam_state.annotated_lock:
                 cam_state.latest_annotated_frame = display_frame
@@ -390,10 +505,14 @@ def inference_loop(cam_state: CameraState):
                 cam_state.set_boolean()
 
             bool_state = cam_state.get_boolean()
+            elapsed = cam_state.get_elapsed_time()
+            position_m = cam_state.get_estimated_position()
             classes_seen = [pred_class(p) for p in preds] if preds else []
             
-            display_frame = draw_detections(frame.copy(), preds)
-            status_text = f"CAM{cam_state.camera_id} | {'CRACK!' if found else 'OK'} | dets={count} conf={best:.2f} blur={blur_score:.1f} bool={bool_state}"
+            display_frame = draw_detections(frame.copy(), preds, position_m)
+            status_text = f"CAM{cam_state.camera_id} | {'CRACK!' if found else 'OK'} | dets={count} conf={best:.2f}"
+            if ENABLE_POSITION_TRACKING:
+                status_text += f" | {position_m:.2f}m / {PIPELINE_LENGTH_METERS:.0f}m"
             status_color = (0, 0, 255) if found else (0, 255, 0)
             cv2.putText(display_frame, status_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, status_color, 2)
             
@@ -402,7 +521,7 @@ def inference_loop(cam_state: CameraState):
             
             print(
                 f"[CAM{cam_state.camera_id}] found={found} count={count} best={best:.2f} "
-                f"blur={blur_score:.1f} boolean={bool_state} classes={classes_seen}"
+                f"blur={blur_score:.1f} pos={position_m:.2f}m boolean={bool_state} classes={classes_seen}"
             )
 
             if found:
@@ -428,48 +547,77 @@ def inference_loop(cam_state: CameraState):
 
             is_persistent = cam_state.check_detection_persistence()
             t = time.time()
-            name = f"cam{cam_state.camera_id}_{stamp()}_{int(t*1000)}"
 
             if found and is_persistent and (t - last_saved_found) >= SAVE_COOLDOWN_S:
                 last_saved_found = t
-                with cam_state.stats_lock:
-                    cam_state.stats["total_saved"] += 1
+                elapsed = cam_state.get_elapsed_time()
+                position_m = cam_state.get_estimated_position()
+                
+                # Process each crack separately
+                for pred in preds:
+                    crack_id = cam_state.increment_crack_counter()
+                    conf = pred_conf(pred)
+                    sev = classify_severity(conf)
+                    area = calculate_crack_area(pred)
+                    class_name = pred_class(pred)
+                    
+                    # Generate filename with position
+                    if ENABLE_POSITION_TRACKING:
+                        name = f"cam{cam_state.camera_id}_crack{crack_id:04d}_pos{position_m:.2f}m_{stamp()}_{int(t*1000)}"
+                    else:
+                        name = f"cam{cam_state.camera_id}_{stamp()}_{int(t*1000)}"
+                    
+                    with cam_state.stats_lock:
+                        cam_state.stats["total_saved"] += 1
 
-                annotated_raw = draw_detections(frame.copy(), preds)
-                annotated_enhanced = draw_detections(processed.copy(), preds)
+                    annotated_raw = draw_detections(frame.copy(), [pred], position_m)
+                    annotated_enhanced = draw_detections(processed.copy(), [pred], position_m)
 
-                metadata = {
-                    "result": result,
-                    "blur_score": blur_score,
-                    "detections": count,
-                    "max_confidence": best,
-                    "timestamp": t,
-                    "preprocessing_enabled": ENABLE_PREPROCESSING,
-                    "persistence_enabled": ENABLE_PERSISTENCE,
-                    "persistence_frames": PERSISTENCE_FRAMES,
-                    "severities": [classify_severity(pred_conf(p)) for p in preds],
-                    "classes": [pred_class(p) for p in preds],
-                    "areas": [calculate_crack_area(p) for p in preds],
-                }
+                    metadata = {
+                        "crack_id": crack_id,
+                        "camera_id": cam_state.camera_id,
+                        "elapsed_sec": elapsed,
+                        "position_m": position_m,
+                        "pipeline_length_m": PIPELINE_LENGTH_METERS,
+                        "result": result,
+                        "blur_score": blur_score,
+                        "detections": 1,
+                        "confidence": conf,
+                        "severity": sev,
+                        "area_px": area,
+                        "class": class_name,
+                        "timestamp": t,
+                        "preprocessing_enabled": ENABLE_PREPROCESSING,
+                        "persistence_enabled": ENABLE_PERSISTENCE,
+                        "persistence_frames": PERSISTENCE_FRAMES,
+                        "position_tracking_enabled": ENABLE_POSITION_TRACKING,
+                    }
 
-                base_found = cam_state.found_dir / name
-                cv2.imwrite(str(base_found) + ".jpg", frame)
-                cv2.imwrite(str(base_found) + "_enhanced.jpg", processed)
-                cv2.imwrite(str(base_found) + "_annotated.jpg", annotated_raw)
-                cv2.imwrite(str(base_found) + "_enhanced_annotated.jpg", annotated_enhanced)
-                Path(str(base_found) + ".json").write_text(json.dumps(metadata, indent=2, default=str))
+                    base_found = cam_state.found_dir / name
+                    cv2.imwrite(str(base_found) + ".jpg", frame)
+                    cv2.imwrite(str(base_found) + "_enhanced.jpg", processed)
+                    cv2.imwrite(str(base_found) + "_annotated.jpg", annotated_raw)
+                    cv2.imwrite(str(base_found) + "_enhanced_annotated.jpg", annotated_enhanced)
+                    Path(str(base_found) + ".json").write_text(json.dumps(metadata, indent=2, default=str))
 
-                base_rt = cam_state.realtime_dir / name
-                cv2.imwrite(str(base_rt) + ".jpg", frame)
-                cv2.imwrite(str(base_rt) + "_enhanced.jpg", processed)
-                cv2.imwrite(str(base_rt) + "_annotated.jpg", annotated_raw)
-                cv2.imwrite(str(base_rt) + "_enhanced_annotated.jpg", annotated_enhanced)
-                Path(str(base_rt) + ".json").write_text(json.dumps(metadata, indent=2, default=str))
+                    base_rt = cam_state.realtime_dir / name
+                    cv2.imwrite(str(base_rt) + ".jpg", frame)
+                    cv2.imwrite(str(base_rt) + "_enhanced.jpg", processed)
+                    cv2.imwrite(str(base_rt) + "_annotated.jpg", annotated_raw)
+                    cv2.imwrite(str(base_rt) + "_enhanced_annotated.jpg", annotated_enhanced)
+                    Path(str(base_rt) + ".json").write_text(json.dumps(metadata, indent=2, default=str))
+                    
+                    # Write to CSV
+                    if ENABLE_POSITION_TRACKING:
+                        cam_state.write_crack_to_csv(
+                            crack_id, elapsed, position_m, conf, sev, 
+                            area, class_name, name + ".jpg", t
+                        )
 
-                print(
-                    f"[CAM{cam_state.camera_id}] SAVED {name} | dets={count} best={best:.2f} "
-                    f"severities={metadata['severities']} classes={metadata['classes']}"
-                )
+                    print(
+                        f"[CAM{cam_state.camera_id}] SAVED crack#{crack_id} at {position_m:.2f}m | "
+                        f"{sev} conf={conf:.2f} class={class_name}"
+                    )
 
         except Exception as e:
             with cam_state.stats_lock:
@@ -627,6 +775,14 @@ def main():
     print(f"  Camera 1           : DISABLED (not connected)")
     print(f"  Flask web server   : http://0.0.0.0:{FLASK_PORT}")
     print(f"  Access from browser: http://<pi-ip>:{FLASK_PORT}")
+    
+    if ENABLE_POSITION_TRACKING:
+        print("\n  PIPELINE LOCALIZATION ENABLED")
+        print(f"  Pipeline Length:   {PIPELINE_LENGTH_METERS:.1f}m")
+        print(f"  Est. Duration:     {ESTIMATED_INSPECTION_DURATION_SEC:.0f}s ({ESTIMATED_INSPECTION_DURATION_SEC/60:.1f} min)")
+        print(f"  Position Estimate: Based on elapsed time (approx. constant speed)")
+        print("  IMPORTANT: This is an APPROXIMATE estimate, not precise odometry!")
+    
     print("=" * 60)
     print("Press Ctrl+C to stop.\n")
 
@@ -650,10 +806,22 @@ def main():
         print("\nStopping...")
         cam0.stop_flag = True
         time.sleep(0.5)
+        
+        # Close CSV files
+        cam0.close_csv()
 
         print("\n" + "=" * 60)
-        print("  FINAL STATS")
+        print("  FINAL STATS - PIPELINE INSPECTION")
         print("=" * 60)
+        
+        if ENABLE_POSITION_TRACKING:
+            elapsed = cam0.get_elapsed_time()
+            final_position = cam0.get_estimated_position()
+            print(f"\n  Pipeline Length:   {PIPELINE_LENGTH_METERS:.1f}m")
+            print(f"  Inspection Time:   {elapsed:.1f}s ({elapsed/60:.1f} min)")
+            print(f"  Final Position:    {final_position:.2f}m")
+            print(f"  Total Cracks:      {cam0.crack_counter}")
+        
         with cam0.stats_lock:
             s = dict(cam0.stats)
         print(f"\n  Camera 0:")
@@ -661,6 +829,12 @@ def main():
         print(f"    Processed:         {s['processed_frames']}")
         print(f"    Saved:             {s['total_saved']}")
         print(f"    Errors:            {s['inference_errors']}")
+        print(f"    Severity: Critical={s['critical_cracks']} High={s['high_cracks']} "\
+              f"Medium={s['medium_cracks']} Low={s['low_cracks']}")
+        
+        if ENABLE_POSITION_TRACKING:
+            print(f"\n  CSV Report: {REPORTS_DIR}/cam0_crack_report_*.csv")
+        
         print("\n" + "=" * 60)
         print("Done.")
 
