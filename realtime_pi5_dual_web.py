@@ -19,7 +19,7 @@ import cv2
 import numpy as np
 from dotenv import load_dotenv
 from inference_sdk import InferenceHTTPClient
-from flask import Flask, Response, render_template_string
+from flask import Flask, Response, render_template_string, jsonify, send_file
 
 # ---------------- ENV ----------------
 load_dotenv(Path(__file__).resolve().parent / ".env", override=True)
@@ -269,6 +269,10 @@ class CameraState:
         self.crack_counter = 0
         self.position_lock = threading.Lock()
         
+        # Crack history for web visualization
+        self.crack_history = []  # List of crack detection records
+        self.history_max_size = 100  # Keep last 100 cracks
+        
         # CSV report file
         if ENABLE_POSITION_TRACKING:
             csv_filename = REPORTS_DIR / f"cam{camera_id}_crack_report_{stamp()}.csv"
@@ -351,6 +355,19 @@ class CameraState:
                     image_name, timestamp
                 ])
                 self.csv_file.flush()
+    
+    def add_crack_to_history(self, crack_data: Dict[str, Any]):
+        """Add crack to history for web visualization"""
+        with self.position_lock:
+            self.crack_history.append(crack_data)
+            # Keep only recent cracks
+            if len(self.crack_history) > self.history_max_size:
+                self.crack_history.pop(0)
+    
+    def get_crack_history(self) -> List[Dict[str, Any]]:
+        """Get crack history for web API"""
+        with self.position_lock:
+            return list(self.crack_history)
     
     def close_csv(self):
         """Close CSV file"""
@@ -613,6 +630,21 @@ def inference_loop(cam_state: CameraState):
                             crack_id, elapsed, position_m, conf, sev, 
                             area, class_name, name + ".jpg", t
                         )
+                    
+                    # Add to web visualization history
+                    cam_state.add_crack_to_history({
+                        "crack_id": crack_id,
+                        "camera_id": cam_state.camera_id,
+                        "position_m": position_m,
+                        "elapsed_sec": elapsed,
+                        "confidence": conf,
+                        "severity": sev,
+                        "area_px": area,
+                        "class": class_name,
+                        "timestamp": t,
+                        "image_path": str(base_found) + "_annotated.jpg",
+                        "timestamp_str": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(t)),
+                    })
 
                     print(
                         f"[CAM{cam_state.camera_id}] SAVED crack#{crack_id} at {position_m:.2f}m | "
@@ -680,52 +712,445 @@ HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Pi5 Dual Camera Crack Detection</title>
+    <title>Pipeline Crack Detection System</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <style>
-        body {
-            font-family: Arial, sans-serif;
-            background: #1a1a1a;
-            color: #fff;
+        * {
             margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            color: #fff;
             padding: 20px;
+            min-height: 100vh;
+        }
+        .header {
+            text-align: center;
+            margin-bottom: 30px;
         }
         h1 {
-            text-align: center;
-            color: #00ff00;
+            color: #00ff88;
+            font-size: 2.5em;
+            text-shadow: 0 0 20px rgba(0, 255, 136, 0.5);
+            margin-bottom: 10px;
         }
-        .container {
+        .stats-bar {
             display: flex;
             justify-content: center;
+            gap: 30px;
+            margin: 20px 0;
             flex-wrap: wrap;
+        }
+        .stat-item {
+            background: rgba(255, 255, 255, 0.1);
+            padding: 10px 20px;
+            border-radius: 8px;
+            backdrop-filter: blur(10px);
+        }
+        .stat-label {
+            font-size: 0.9em;
+            opacity: 0.7;
+        }
+        .stat-value {
+            font-size: 1.5em;
+            font-weight: bold;
+            color: #00ff88;
+        }
+        
+        /* Pipeline Visualization */
+        .pipeline-section {
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 15px;
+            padding: 25px;
+            margin: 20px 0;
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+        .pipeline-title {
+            font-size: 1.5em;
+            margin-bottom: 20px;
+            color: #00ff88;
+        }
+        .pipeline-container {
+            position: relative;
+            width: 100%;
+            height: 120px;
+            background: linear-gradient(to right, #2a2a2a 0%, #3a3a3a 50%, #2a2a2a 100%);
+            border-radius: 60px;
+            overflow: visible;
+            border: 3px solid #555;
+            box-shadow: inset 0 4px 10px rgba(0,0,0,0.5);
+        }
+        .pipeline-markers {
+            position: absolute;
+            bottom: -30px;
+            width: 100%;
+            display: flex;
+            justify-content: space-between;
+            padding: 0 10px;
+            font-size: 0.8em;
+            color: #888;
+        }
+        .crack-marker {
+            position: absolute;
+            width: 20px;
+            height: 20px;
+            border-radius: 50%;
+            cursor: pointer;
+            top: 50%;
+            transform: translate(-50%, -50%);
+            transition: all 0.3s ease;
+            z-index: 10;
+            animation: pulse 2s infinite;
+        }
+        .crack-marker.CRITICAL {
+            background: #ff0000;
+            box-shadow: 0 0 15px #ff0000, 0 0 30px #ff000080;
+        }
+        .crack-marker.HIGH {
+            background: #ff6600;
+            box-shadow: 0 0 15px #ff6600, 0 0 30px #ff660080;
+        }
+        .crack-marker.MEDIUM {
+            background: #ffff00;
+            box-shadow: 0 0 15px #ffff00, 0 0 30px #ffff0080;
+        }
+        .crack-marker.LOW {
+            background: #00ff00;
+            box-shadow: 0 0 15px #00ff00, 0 0 30px #00ff0080;
+        }
+        .crack-marker:hover {
+            transform: translate(-50%, -50%) scale(1.5);
+            z-index: 100;
+        }
+        @keyframes pulse {
+            0%, 100% { transform: translate(-50%, -50%) scale(1); }
+            50% { transform: translate(-50%, -50%) scale(1.2); }
+        }
+        
+        /* Modal */
+        .modal {
+            display: none;
+            position: fixed;
+            z-index: 1000;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.8);
+            backdrop-filter: blur(5px);
+        }
+        .modal-content {
+            background: linear-gradient(135deg, #2a2a3e 0%, #1e2742 100%);
+            margin: 5% auto;
+            padding: 0;
+            border-radius: 15px;
+            width: 90%;
+            max-width: 800px;
+            box-shadow: 0 10px 50px rgba(0, 255, 136, 0.3);
+            border: 2px solid rgba(0, 255, 136, 0.3);
+            max-height: 90vh;
+            overflow-y: auto;
+        }
+        .modal-header {
+            padding: 20px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .modal-body {
+            padding: 20px;
+        }
+        .close {
+            color: #aaa;
+            font-size: 35px;
+            font-weight: bold;
+            cursor: pointer;
+            transition: color 0.3s;
+        }
+        .close:hover {
+            color: #00ff88;
+        }
+        .crack-image {
+            width: 100%;
+            border-radius: 10px;
+            margin-bottom: 20px;
+            border: 2px solid rgba(255, 255, 255, 0.2);
+        }
+        .detail-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin-top: 20px;
+        }
+        .detail-item {
+            background: rgba(255, 255, 255, 0.05);
+            padding: 15px;
+            border-radius: 8px;
+            border-left: 4px solid #00ff88;
+        }
+        .detail-label {
+            font-size: 0.9em;
+            opacity: 0.7;
+            margin-bottom: 5px;
+        }
+        .detail-value {
+            font-size: 1.3em;
+            font-weight: bold;
+        }
+        .severity-badge {
+            display: inline-block;
+            padding: 5px 15px;
+            border-radius: 20px;
+            font-weight: bold;
+            text-transform: uppercase;
+        }
+        .severity-CRITICAL {
+            background: #ff0000;
+            color: #fff;
+        }
+        .severity-HIGH {
+            background: #ff6600;
+            color: #fff;
+        }
+        .severity-MEDIUM {
+            background: #ffff00;
+            color: #000;
+        }
+        .severity-LOW {
+            background: #00ff00;
+            color: #000;
+        }
+        
+        /* Camera Feed */
+        .camera-container {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
             gap: 20px;
+            margin-top: 20px;
         }
         .camera-box {
-            background: #2a2a2a;
-            border: 2px solid #444;
-            border-radius: 10px;
-            padding: 15px;
-            text-align: center;
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 15px;
+            padding: 20px;
+            backdrop-filter: blur(10px);
         }
-        img {
-            max-width: 640px;
+        .camera-box h2 {
+            color: #00ff88;
+            margin-bottom: 15px;
+        }
+        .camera-box img {
             width: 100%;
-            border: 2px solid #666;
-            border-radius: 5px;
+            border-radius: 10px;
+            border: 2px solid rgba(255, 255, 255, 0.2);
+        }
+        
+        /* Legend */
+        .legend {
+            display: flex;
+            justify-content: center;
+            gap: 20px;
+            margin-top: 15px;
+            flex-wrap: wrap;
+        }
+        .legend-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 0.9em;
+        }
+        .legend-color {
+            width: 15px;
+            height: 15px;
+            border-radius: 50%;
+        }
+        
+        /* Responsive */
+        @media (max-width: 768px) {
+            h1 {
+                font-size: 1.8em;
+            }
+            .pipeline-container {
+                height: 80px;
+            }
+            .modal-content {
+                width: 95%;
+                margin: 10% auto;
+            }
         }
     </style>
 </head>
 <body>
-    <h1>🔍 Pi5 Dual Camera Crack Detection</h1>
-    <div class="container">
-        <div class="camera-box">
-            <h2>Camera 0</h2>
-            <img src="/video_feed/0" alt="Camera 0">
+    <div class="header">
+        <h1>🔍 Pipeline Crack Detection System</h1>
+    </div>
+    
+    <div class="stats-bar">
+        <div class="stat-item">
+            <div class="stat-label">Pipeline Length</div>
+            <div class="stat-value" id="pipeline-length">-</div>
         </div>
-        <div class="camera-box">
-            <h2>Camera 1</h2>
-            <img src="/video_feed/1" alt="Camera 1">
+        <div class="stat-item">
+            <div class="stat-label">Current Position</div>
+            <div class="stat-value" id="current-position">-</div>
+        </div>
+        <div class="stat-item">
+            <div class="stat-label">Total Cracks</div>
+            <div class="stat-value" id="total-cracks">0</div>
+        </div>
+        <div class="stat-item">
+            <div class="stat-label">Critical</div>
+            <div class="stat-value" style="color: #ff0000;" id="critical-count">0</div>
         </div>
     </div>
+    
+    <div class="pipeline-section">
+        <div class="pipeline-title">Pipeline Visualization</div>
+        <div class="pipeline-container" id="pipeline-container">
+            <div class="pipeline-markers">
+                <span>0m</span>
+                <span id="pipeline-end">100m</span>
+            </div>
+        </div>
+        <div class="legend">
+            <div class="legend-item">
+                <div class="legend-color" style="background: #ff0000;"></div>
+                <span>Critical</span>
+            </div>
+            <div class="legend-item">
+                <div class="legend-color" style="background: #ff6600;"></div>
+                <span>High</span>
+            </div>
+            <div class="legend-item">
+                <div class="legend-color" style="background: #ffff00;"></div>
+                <span>Medium</span>
+            </div>
+            <div class="legend-item">
+                <div class="legend-color" style="background: #00ff00;"></div>
+                <span>Low</span>
+            </div>
+        </div>
+    </div>
+    
+    <div class="camera-container">
+        <div class="camera-box">
+            <h2>📹 Camera Feed</h2>
+            <img src="/video_feed/0" alt="Camera 0">
+        </div>
+    </div>
+    
+    <!-- Crack Detail Modal -->
+    <div id="crackModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2 id="modal-title">Crack Details</h2>
+                <span class="close">&times;</span>
+            </div>
+            <div class="modal-body">
+                <img id="modal-image" class="crack-image" src="" alt="Crack Image">
+                <div class="detail-grid">
+                    <div class="detail-item">
+                        <div class="detail-label">Crack ID</div>
+                        <div class="detail-value" id="modal-crack-id">-</div>
+                    </div>
+                    <div class="detail-item">
+                        <div class="detail-label">Position</div>
+                        <div class="detail-value" id="modal-position">-</div>
+                    </div>
+                    <div class="detail-item">
+                        <div class="detail-label">Confidence</div>
+                        <div class="detail-value" id="modal-confidence">-</div>
+                    </div>
+                    <div class="detail-item">
+                        <div class="detail-label">Severity</div>
+                        <div class="detail-value" id="modal-severity">-</div>
+                    </div>
+                    <div class="detail-item">
+                        <div class="detail-label">Area (pixels)</div>
+                        <div class="detail-value" id="modal-area">-</div>
+                    </div>
+                    <div class="detail-item">
+                        <div class="detail-label">Detection Time</div>
+                        <div class="detail-value" id="modal-time">-</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        const modal = document.getElementById('crackModal');
+        const closeBtn = document.getElementsByClassName('close')[0];
+        const pipelineContainer = document.getElementById('pipeline-container');
+        
+        closeBtn.onclick = function() {
+            modal.style.display = 'none';
+        }
+        
+        window.onclick = function(event) {
+            if (event.target == modal) {
+                modal.style.display = 'none';
+            }
+        }
+        
+        function showCrackDetail(crack) {
+            document.getElementById('modal-title').textContent = `Crack #${crack.crack_id} Details`;
+            document.getElementById('modal-image').src = `/crack_image/${crack.camera_id}/${crack.crack_id}`;
+            document.getElementById('modal-crack-id').textContent = crack.crack_id;
+            document.getElementById('modal-position').textContent = crack.position_m.toFixed(2) + ' m';
+            document.getElementById('modal-confidence').textContent = (crack.confidence * 100).toFixed(1) + '%';
+            document.getElementById('modal-area').textContent = Math.round(crack.area_px) + ' px²';
+            document.getElementById('modal-time').textContent = crack.timestamp_str;
+            
+            const severityEl = document.getElementById('modal-severity');
+            severityEl.innerHTML = `<span class="severity-badge severity-${crack.severity}">${crack.severity}</span>`;
+            
+            modal.style.display = 'block';
+        }
+        
+        function updatePipeline() {
+            fetch('/api/cracks')
+                .then(response => response.json())
+                .then(data => {
+                    const pipelineLength = data.pipeline_length_m;
+                    const cracks = data.cracks;
+                    
+                    // Update stats
+                    document.getElementById('pipeline-length').textContent = pipelineLength.toFixed(1) + 'm';
+                    document.getElementById('pipeline-end').textContent = pipelineLength.toFixed(0) + 'm';
+                    document.getElementById('current-position').textContent = data.current_position_m.toFixed(2) + 'm';
+                    document.getElementById('total-cracks').textContent = cracks.length;
+                    
+                    const criticalCount = cracks.filter(c => c.severity === 'CRITICAL').length;
+                    document.getElementById('critical-count').textContent = criticalCount;
+                    
+                    // Clear existing markers
+                    const existingMarkers = pipelineContainer.querySelectorAll('.crack-marker');
+                    existingMarkers.forEach(m => m.remove());
+                    
+                    // Add crack markers
+                    cracks.forEach(crack => {
+                        const marker = document.createElement('div');
+                        marker.className = `crack-marker ${crack.severity}`;
+                        const percentage = (crack.position_m / pipelineLength) * 100;
+                        marker.style.left = percentage + '%';
+                        marker.title = `Crack #${crack.crack_id} at ${crack.position_m.toFixed(2)}m - ${crack.severity}`;
+                        marker.onclick = () => showCrackDetail(crack);
+                        pipelineContainer.appendChild(marker);
+                    });
+                })
+                .catch(error => console.error('Error fetching crack data:', error));
+        }
+        
+        // Update every 2 seconds
+        updatePipeline();
+        setInterval(updatePipeline, 2000);
+    </script>
 </body>
 </html>
 """
@@ -734,6 +1159,38 @@ HTML_TEMPLATE = """
 @app.route('/')
 def index():
     return render_template_string(HTML_TEMPLATE)
+
+
+@app.route('/api/cracks')
+def get_cracks():
+    """API endpoint to get all detected cracks"""
+    if cam0 is None:
+        return jsonify({"error": "Camera not initialized"}), 500
+    
+    cracks = cam0.get_crack_history()
+    current_position = cam0.get_estimated_position()
+    
+    return jsonify({
+        "pipeline_length_m": PIPELINE_LENGTH_METERS,
+        "current_position_m": current_position,
+        "total_cracks": len(cracks),
+        "cracks": cracks,
+    })
+
+
+@app.route('/crack_image/<int:camera_id>/<int:crack_id>')
+def get_crack_image(camera_id, crack_id):
+    """Serve crack image by ID"""
+    if cam0 is None:
+        return "Camera not initialized", 500
+    
+    cracks = cam0.get_crack_history()
+    crack = next((c for c in cracks if c["crack_id"] == crack_id), None)
+    
+    if crack and Path(crack["image_path"]).exists():
+        return send_file(crack["image_path"], mimetype='image/jpeg')
+    else:
+        return "Image not found", 404
 
 
 def generate_frames(cam_state: CameraState):
