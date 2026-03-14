@@ -504,8 +504,8 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 ## 👥 Authors
 
 **Final Year Project 2026**
-- Industrial Pipeline Inspection System
-- AI-Powered Defect Detection
+- Department of Engineering University of Nicosia
+- Shayan NaghashpourShoushtari
 
 ---
 
@@ -522,9 +522,8 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 ## 📞 Support
 
 For issues, questions, or contributions:
-- 📧 Email: [your-email@example.com]
-- 🐛 Issues: [GitHub Issues](https://github.com/your-repo/issues)
-- 📖 Docs: [Project Wiki](https://github.com/your-repo/wiki)
+- 📧 Email: [nshayan81@hotmail.com]
+
 
 ---
 
