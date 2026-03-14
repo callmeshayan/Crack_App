@@ -4,7 +4,7 @@ from pathlib import Path
 
 import cv2
 
-from roboflow_client import RoboflowClient
+from roboflow_client import RFClient
 
 
 def draw_detections(img, dets):
@@ -34,7 +34,7 @@ def main():
         print(f"File not found: {image_path}")
         sys.exit(1)
 
-    client = RoboflowClient()
+    client = RFClient()
 
     img = cv2.imread(str(image_path))
     if img is None:

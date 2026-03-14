@@ -1,0 +1,163 @@
+
+INTERACTIVE STARTUP SCREEN
+================================================================================
+
+$ python realtime_pi5_dual_web.py
+
+============================================================
+PIPELINE CRACK DETECTION SYSTEM
+Inspection Configuration
+============================================================
+
+SELECT MODEL MODE:
+  1. OFFLINE - Local YOLO model (no internet required)
+  2. ONLINE  - Roboflow Rapid API (requires internet)
+
+Enter choice [1/2] (default: 1): █
+
+
+[OPERATOR SELECTS: 1]
+
+
+PIPELINE LENGTH:
+  Enter pipeline length in meters (default: 100.0): █
+
+
+[OPERATOR ENTERS: 150]
+
+
+ROBOT VELOCITY:
+  Available units: m/s or km/h
+  Enter unit [m/s/km/h] (default: m/s): █
+
+
+[OPERATOR ENTERS: km/h]
+
+
+  Enter velocity in km/h (default: 0.5): █
+
+
+[OPERATOR ENTERS: 2.0]
+
+
+------------------------------------------------------------
+CONFIGURATION SUMMARY:
+------------------------------------------------------------
+  Model Mode:       OFFLINE
+  Pipeline Length:  150.00 meters
+  Robot Velocity:   2.00 km/h
+  Estimated Time:   270.0 seconds (4.5 minutes)
+------------------------------------------------------------
+
+Proceed with this configuration? [Y/n]: █
+
+
+[OPERATOR CONFIRMS: y]
+
+
+[INIT] Starting system with operator configuration...
+
+[INIT] Initialized OFFLINE mode with local YOLO model: /path/to/best.pt
+[INIT] Using device: cpu
+[INIT] Robot velocity: 2.0 km/h (0.556 m/s)
+[INIT] Pipeline length: 150.0m
+[INIT] Estimated inspection time: 270.0s (4.5 min)
+
+[INIT] Starting Flask server...
+ * Running on http://0.0.0.0:5000
+ * Press CTRL+C to quit
+
+[CAM0] Camera 0 initialized
+[CAM1] Camera 1 initialized
+[CAM0] Capture started
+[CAM1] Capture started
+[CAM0] Inference loop started
+[CAM1] Inference loop started
+
+System ready for inspection!
+
+================================================================================
+
+
+QUICK START EXAMPLE (using all defaults):
+================================================================================
+
+$ python realtime_pi5_dual_web.py
+
+============================================================
+PIPELINE CRACK DETECTION SYSTEM
+Inspection Configuration
+============================================================
+
+SELECT MODEL MODE:
+  1. OFFLINE - Local YOLO model (no internet required)
+  2. ONLINE  - Roboflow Rapid API (requires internet)
+
+Enter choice [1/2] (default: 1): [ENTER]
+
+PIPELINE LENGTH:
+  Enter pipeline length in meters (default: 100.0): [ENTER]
+
+ROBOT VELOCITY:
+  Available units: m/s or km/h
+  Enter unit [m/s/km/h] (default: m/s): [ENTER]
+  Enter velocity in m/s (default: 0.5): [ENTER]
+
+------------------------------------------------------------
+CONFIGURATION SUMMARY:
+------------------------------------------------------------
+  Model Mode:       OFFLINE
+  Pipeline Length:  100.00 meters
+  Robot Velocity:   0.50 m/s
+  Estimated Time:   200.0 seconds (3.3 minutes)
+------------------------------------------------------------
+
+Proceed with this configuration? [Y/n]: [ENTER]
+
+[INIT] Starting system with operator configuration...
+
+[System starts...]
+
+================================================================================
+
+
+ERROR HANDLING EXAMPLE:
+================================================================================
+
+PIPELINE LENGTH:
+  Enter pipeline length in meters (default: 100.0): -50
+  Error: Length must be positive.
+  Enter pipeline length in meters (default: 100.0): abc
+  Error: Please enter a valid number.
+  Enter pipeline length in meters (default: 100.0): 75
+
+ROBOT VELOCITY:
+  Available units: m/s or km/h
+  Enter unit [m/s/km/h] (default: m/s): mph
+  Error: Please enter 'm/s' or 'km/h'.
+  Enter unit [m/s/km/h] (default: m/s): m/s
+  Enter velocity in m/s (default: 0.5): 0
+  Error: Velocity must be positive.
+  Enter velocity in m/s (default: 0.5): 0.8
+
+================================================================================
+
+
+CANCELLED CONFIGURATION EXAMPLE:
+================================================================================
+
+------------------------------------------------------------
+CONFIGURATION SUMMARY:
+------------------------------------------------------------
+  Model Mode:       OFFLINE
+  Pipeline Length:  50.00 meters
+  Robot Velocity:   1.50 m/s
+  Estimated Time:   33.3 seconds (0.6 minutes)
+------------------------------------------------------------
+
+Proceed with this configuration? [Y/n]: n
+Configuration cancelled. Exiting...
+
+$ _
+
+================================================================================

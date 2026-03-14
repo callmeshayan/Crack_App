@@ -7,9 +7,6 @@ import cv2
 from dotenv import load_dotenv
 from inference_sdk import InferenceHTTPClient
 
-from pathlib import Path
-from dotenv import load_dotenv
-
 load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env", override=True)
 
 
@@ -81,41 +78,6 @@ def extract_detections(result):
         ) and (
             ("x" in obj and "y" in obj) or
             ("x1" in obj and "y1" in obj and "x2" in obj and "y2" in obj)
-        )
-
-    def walk(node):
-        if isinstance(node, list):
-            if node and all(looks_like_det(x) for x in node):
-                return node
-            for x in node:
-                out = walk(x)
-                if out is not None:
-                    return out
-        elif isinstance(node, dict):
-            for v in node.values():
-                out = walk(v)
-                if out is not None:
-                    return out
-        return None
-
-    found = walk(result)
-    return found if found is not None else []
-
-    """
-    Workflow outputs differ depending on the blocks used.
-    This function searches for the first list of detections-like objects.
-    """
-    # Most direct case
-    if isinstance(result.get("predictions"), list):
-        return result["predictions"]
-
-    # Workflow results often have nested steps/outputs
-    # Search recursively for a list of dicts that looks like detections
-    def looks_like_det(obj):
-        return isinstance(obj, dict) and (
-            "confidence" in obj or "score" in obj
-        ) and (
-            "x" in obj or ("x1" in obj and "x2" in obj)
         )
 
     def walk(node):

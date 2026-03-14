@@ -1,0 +1,209 @@
+╔══════════════════════════════════════════════════════════════════════════╗
+║                                                                          ║
+║             PIPELINE CRACK DETECTION SYSTEM                              ║
+║                   Quick Reference Card                                   ║
+║                                                                          ║
+╚══════════════════════════════════════════════════════════════════════════╝
+
+┌────────────────────────────────────────────────────────────────────────┐
+│ STARTING THE SYSTEM                                                    │
+└────────────────────────────────────────────────────────────────────────┘
+
+Command:    python realtime_pi5_dual_web.py
+
+You will be prompted for:
+  1. Model Selection (Offline/Online)
+  2. Pipeline Length (meters)
+  3. Robot Velocity (m/s or km/h)
+
+Press ENTER to accept default values shown in [brackets]
+
+
+┌────────────────────────────────────────────────────────────────────────┐
+│ MODEL SELECTION                                                        │
+└────────────────────────────────────────────────────────────────────────┘
+
+Option 1: OFFLINE (Recommended)
+  - Uses local trained model
+  - No internet required
+  - Faster inference
+  - Best for production
+
+Option 2: ONLINE
+  - Uses Roboflow cloud API
+  - Requires internet
+  - Good for testing/development
+
+
+┌────────────────────────────────────────────────────────────────────────┐
+│ VELOCITY GUIDE                                                         │
+└────────────────────────────────────────────────────────────────────────┘
+
+Common Values:
+
+  SLOW INSPECTION (detailed)
+    0.3 m/s  or  1.08 km/h
+
+  STANDARD INSPECTION (recommended)
+    0.5 m/s  or  1.8 km/h
+
+  FAST INSPECTION
+    1.0 m/s  or  3.6 km/h
+
+  VERY FAST INSPECTION
+    2.0 m/s  or  7.2 km/h
+
+Conversion: km/h = m/s × 3.6
+
+
+┌────────────────────────────────────────────────────────────────────────┐
+│ DURING INSPECTION                                                      │
+└────────────────────────────────────────────────────────────────────────┘
+
+Web Interface:  http://raspberrypi-ip:5000
+                (or http://localhost:5000 on same machine)
+
+What you'll see:
+  - Live video feeds from both cameras
+  - Current position in pipeline
+  - Total cracks detected
+  - Severity breakdown (Critical/High/Medium/Low)
+  - Real-time crack markers on pipeline visualization
+
+To Generate Report:
+  - Click "Generate PDF Report" button
+  - PDF downloads automatically
+  - Contains full inspection summary
+
+
+┌────────────────────────────────────────────────────────────────────────┐
+│ STOPPING THE SYSTEM                                                    │
+└────────────────────────────────────────────────────────────────────────┘
+
+Press:  Ctrl+C  (or Cmd+C on Mac)
+
+System will:
+  - Stop cameras safely
+  - Save final results
+  - Close all connections
+
+
+┌────────────────────────────────────────────────────────────────────────┐
+│ TYPICAL INSPECTION WORKFLOW                                            │
+└────────────────────────────────────────────────────────────────────────┘
+
+1. Start system with: python realtime_pi5_dual_web.py
+
+2. Configure inspection parameters:
+   - Select model: 1 (offline) or 2 (online)
+   - Enter pipeline length in meters
+   - Choose velocity unit: m/s or km/h
+   - Enter robot velocity
+   - Confirm configuration
+
+3. Open web interface in browser
+
+4. Begin robot movement through pipeline
+
+5. Monitor detection in real-time
+
+6. After inspection complete:
+   - Click "Generate PDF Report"
+   - Review detected cracks
+   - Download report
+
+7. Stop system with Ctrl+C
+
+
+┌────────────────────────────────────────────────────────────────────────┐
+│ EXAMPLE: QUICK START                                                   │
+└────────────────────────────────────────────────────────────────────────┘
+
+$ python realtime_pi5_dual_web.py
+
+Enter choice [1/2] (default: 1): [ENTER]         → Use offline model
+Enter pipeline length (default: 100.0): [ENTER]  → Use 100m
+Enter unit (default: m/s): [ENTER]               → Use m/s
+Enter velocity (default: 0.5): [ENTER]           → Use 0.5 m/s
+Proceed? [Y/n]: [ENTER]                          → Confirm
+
+System starts in 5 seconds!
+
+
+┌────────────────────────────────────────────────────────────────────────┐
+│ EXAMPLE: CUSTOM CONFIGURATION                                          │
+└────────────────────────────────────────────────────────────────────────┘
+
+$ python realtime_pi5_dual_web.py
+
+Enter choice [1/2] (default: 1): 1               → Offline model
+Enter pipeline length (default: 100.0): 150      → 150 meter pipe
+Enter unit (default: m/s): km/h                  → Use km/h
+Enter velocity (default: 0.5): 2.5               → 2.5 km/h speed
+Proceed? [Y/n]: y                                → Confirm
+
+Estimated time: 216 seconds (3.6 minutes)
+
+
+┌────────────────────────────────────────────────────────────────────────┐
+│ RESULTS LOCATION                                                       │
+└────────────────────────────────────────────────────────────────────────┘
+
+All results saved in:  data/realtime_results/
+
+  camera0_found/           → Camera 0 detected cracks
+  camera1_found/           → Camera 1 detected cracks
+  camera0_realtime/        → Camera 0 real-time saves
+  camera1_realtime/        → Camera 1 real-time saves
+  reports/                 → PDF inspection reports
+
+Each crack includes:
+  - Original image
+  - Enhanced image
+  - Annotated image (with detections)
+  - Enhanced annotated image
+  - JSON metadata with position, confidence, severity
+
+
+┌────────────────────────────────────────────────────────────────────────┐
+│ TROUBLESHOOTING                                                        │
+└────────────────────────────────────────────────────────────────────────┘
+
+Problem: Wrong values entered
+Solution: Press 'n' when asked to confirm, then restart
+
+Problem: System won't start
+Check: 
+  - Cameras connected?
+  - Correct model file path?
+  - All dependencies installed?
+
+Problem: No detections
+Check:
+  - Lighting conditions adequate?
+  - Camera focused properly?
+  - Robot moving at configured speed?
+
+Problem: Estimated time doesn't match actual
+Solution: Adjust velocity in next run to match actual robot speed
+
+
+┌────────────────────────────────────────────────────────────────────────┐
+│ IMPORTANT NOTES                                                        │
+└────────────────────────────────────────────────────────────────────────┘
+
+  ⚠  Position accuracy depends on constant robot velocity
+  ⚠  Ensure cameras have adequate lighting
+  ⚠  Keep robot speed consistent throughout inspection
+  ⚠  Review PDF report after each inspection
+  ⚠  Backup inspection data regularly
+
+
+═══════════════════════════════════════════════════════════════════════════
+
+For detailed documentation, see:
+  - OPERATOR_GUIDE.md        (Complete operator manual)
+  - PROFESSIONAL_UPDATES.md  (All features and changes)
+  - STARTUP_EXAMPLE.txt      (Detailed startup examples)
+
+═══════════════════════════════════════════════════════════════════════════

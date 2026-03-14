@@ -1,7 +1,18 @@
 opencv-python>=4.8.0
 python-dotenv>=1.0.0
-inference-sdk>=0.9.0
-PySide6>=6.5.0
 numpy>=1.24.0
 requests>=2.31.0
 flask>=3.0.0
+reportlab>=4.0.0
+pillow>=10.0.0
+
+# For online mode (Roboflow Rapid API)
+inference-sdk>=0.9.0
+
+# For offline mode (Local YOLO model)
+ultralytics>=8.0.0
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Optional GUI (not needed for Raspberry Pi headless)
+# PySide6>=6.5.0
