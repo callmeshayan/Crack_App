@@ -19,7 +19,7 @@ import cv2
 import numpy as np
 from dotenv import load_dotenv
 from inference_sdk import InferenceHTTPClient
-from flask import Flask, Response, render_template_string, jsonify, send_file
+from flask import Flask, Response, render_template_string, jsonify, send_file, request
 
 # ---------------- ENV ----------------
 load_dotenv(Path(__file__).resolve().parent / ".env", override=True)
@@ -59,11 +59,11 @@ BOOLEAN_DURATION_S = 1.0
 # Position is estimated based on elapsed time assuming constant robot speed
 
 # Set your pipeline length in meters
-PIPELINE_LENGTH_METERS = 100.0  # Change to your actual pipeline length
+PIPELINE_LENGTH_METERS = 100.0  # Default - can be changed via webapp
 
 # Set estimated inspection duration in seconds (time to traverse full pipeline)
 # Example: If robot takes 10 minutes to inspect 100m pipe, set to 600.0
-ESTIMATED_INSPECTION_DURATION_SEC = 600.0  # Change based on your robot speed
+ESTIMATED_INSPECTION_DURATION_SEC = 600.0  # Default - can be changed via webapp
 
 # Alternative: If you know robot speed, calculate duration:
 # ROBOT_SPEED_MPS = 0.167  # meters per second (e.g., 10 m/min = 0.167 m/s)
@@ -708,6 +708,258 @@ app = Flask(__name__)
 cam0 = None
 cam1 = None
 
+# Project configuration state
+project_config = {
+    "initialized": False,
+    "pipeline_length": PIPELINE_LENGTH_METERS,
+    "inspection_duration": ESTIMATED_INSPECTION_DURATION_SEC,
+    "enable_camera0": True,
+    "enable_camera1": True,
+    "started": False,
+    "paused": False,
+}
+config_lock = threading.Lock()
+
+CONFIG_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Project Configuration - Pipeline Crack Detection</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            color: #fff;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            padding: 20px;
+        }
+        .config-container {
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 20px;
+            padding: 40px;
+            max-width: 600px;
+            width: 100%;
+            backdrop-filter: blur(10px);
+            border: 2px solid rgba(0, 255, 136, 0.3);
+            box-shadow: 0 10px 50px rgba(0, 0, 0, 0.5);
+        }
+        h1 {
+            color: #00ff88;
+            font-size: 2.5em;
+            text-align: center;
+            margin-bottom: 10px;
+            text-shadow: 0 0 20px rgba(0, 255, 136, 0.5);
+        }
+        .subtitle {
+            text-align: center;
+            opacity: 0.7;
+            margin-bottom: 30px;
+        }
+        .form-group {
+            margin-bottom: 25px;
+        }
+        label {
+            display: block;
+            margin-bottom: 8px;
+            color: #00ff88;
+            font-weight: 600;
+        }
+        .help-text {
+            font-size: 0.85em;
+            opacity: 0.7;
+            margin-top: 5px;
+        }
+        input[type="number"], input[type="text"] {
+            width: 100%;
+            padding: 12px;
+            border-radius: 8px;
+            border: 2px solid rgba(255, 255, 255, 0.2);
+            background: rgba(255, 255, 255, 0.05);
+            color: #fff;
+            font-size: 1em;
+            transition: all 0.3s;
+        }
+        input[type="number"]:focus, input[type="text"]:focus {
+            outline: none;
+            border-color: #00ff88;
+            background: rgba(0, 255, 136, 0.05);
+        }
+        .checkbox-group {
+            display: flex;
+            gap: 20px;
+            margin-top: 10px;
+        }
+        .checkbox-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        input[type="checkbox"] {
+            width: 20px;
+            height: 20px;
+            cursor: pointer;
+        }
+        .btn {
+            width: 100%;
+            padding: 15px;
+            border-radius: 8px;
+            border: none;
+            background: linear-gradient(135deg, #00ff88 0%, #00cc6a 100%);
+            color: #000;
+            font-size: 1.2em;
+            font-weight: bold;
+            cursor: pointer;
+            transition: all 0.3s;
+            margin-top: 20px;
+        }
+        .btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 20px rgba(0, 255, 136, 0.4);
+        }
+        .btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            transform: none;
+        }
+        .info-box {
+            background: rgba(0, 136, 255, 0.1);
+            border-left: 4px solid #0088ff;
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 25px;
+        }
+        .info-box h3 {
+            color: #0088ff;
+            margin-bottom: 8px;
+        }
+        .error {
+            background: rgba(255, 0, 0, 0.1);
+            border: 1px solid #ff0000;
+            padding: 10px;
+            border-radius: 5px;
+            margin-top: 10px;
+            display: none;
+        }
+    </style>
+</head>
+<body>
+    <div class="config-container">
+        <h1>🔧 Project Setup</h1>
+        <p class="subtitle">Configure your pipeline inspection parameters</p>
+        
+        <div class="info-box">
+            <h3>ℹ️ Before You Start</h3>
+            <p>Set up your pipeline parameters for accurate crack position tracking. These settings can be adjusted based on your robot's speed and pipeline dimensions.</p>
+        </div>
+        
+        <form id="configForm">
+            <div class="form-group">
+                <label for="pipelineLength">Pipeline Length (meters)</label>
+                <input type="number" id="pipelineLength" value="100" min="1" max="10000" step="0.1" required>
+                <p class="help-text">Total length of the pipeline to inspect</p>
+            </div>
+            
+            <div class="form-group">
+                <label for="inspectionDuration">Estimated Inspection Duration (seconds)</label>
+                <input type="number" id="inspectionDuration" value="600" min="10" max="86400" step="1" required>
+                <p class="help-text">How long will it take to traverse the entire pipeline? (e.g., 600s = 10 minutes)</p>
+            </div>
+            
+            <div class="form-group">
+                <label>Camera Configuration</label>
+                <div class="checkbox-group">
+                    <div class="checkbox-item">
+                        <input type="checkbox" id="enableCamera0" checked>
+                        <label for="enableCamera0" style="margin: 0;">Camera 0 (Primary)</label>
+                    </div>
+                    <div class="checkbox-item">
+                        <input type="checkbox" id="enableCamera1" checked>
+                        <label for="enableCamera1" style="margin: 0;">Camera 1 (Secondary)</label>
+                    </div>
+                </div>
+                <p class="help-text">Select which cameras to use for inspection</p>
+            </div>
+            
+            <div id="calculatedSpeed" style="background: rgba(0, 255, 136, 0.1); padding: 15px; border-radius: 8px; margin: 20px 0;">
+                <strong>Calculated Robot Speed:</strong> <span id="speedValue">0.17</span> m/s
+            </div>
+            
+            <button type="submit" class="btn">Start Inspection System</button>
+            
+            <div class="error" id="errorMsg"></div>
+        </form>
+    </div>
+    
+    <script>
+        // Calculate speed dynamically
+        function updateSpeed() {
+            const length = parseFloat(document.getElementById('pipelineLength').value) || 100;
+            const duration = parseFloat(document.getElementById('inspectionDuration').value) || 600;
+            const speed = (length / duration).toFixed(3);
+            document.getElementById('speedValue').textContent = speed;
+        }
+        
+        document.getElementById('pipelineLength').addEventListener('input', updateSpeed);
+        document.getElementById('inspectionDuration').addEventListener('input', updateSpeed);
+        updateSpeed();
+        
+        // Handle form submission
+        document.getElementById('configForm').addEventListener('submit', async function(e) {
+            e.preventDefault();
+            
+            const config = {
+                pipeline_length: parseFloat(document.getElementById('pipelineLength').value),
+                inspection_duration: parseFloat(document.getElementById('inspectionDuration').value),
+                enable_camera0: document.getElementById('enableCamera0').checked,
+                enable_camera1: document.getElementById('enableCamera1').checked
+            };
+            
+            // Validate at least one camera is enabled
+            if (!config.enable_camera0 && !config.enable_camera1) {
+                document.getElementById('errorMsg').textContent = 'Please enable at least one camera';
+                document.getElementById('errorMsg').style.display = 'block';
+                return;
+            }
+            
+            try {
+                // Save configuration
+                const response = await fetch('/api/config', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(config)
+                });
+                
+                if (!response.ok) throw new Error('Configuration failed');
+                
+                // Start project
+                const startResponse = await fetch('/api/start_project', {
+                    method: 'POST'
+                });
+                
+                if (!startResponse.ok) throw new Error('Failed to start project');
+                
+                // Redirect to dashboard
+                window.location.href = '/';
+                
+            } catch (error) {
+                document.getElementById('errorMsg').textContent = 'Error: ' + error.message;
+                document.getElementById('errorMsg').style.display = 'block';
+            }
+        });
+    </script>
+</body>
+</html>
+"""
+
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html>
@@ -970,6 +1222,28 @@ HTML_TEMPLATE = """
             border-radius: 50%;
         }
         
+        /* Control Buttons */
+        .control-btn {
+            padding: 12px 25px;
+            border-radius: 8px;
+            border: none;
+            background: linear-gradient(135deg, #00ff88 0%, #00cc6a 100%);
+            color: #000;
+            font-size: 1.1em;
+            font-weight: bold;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+        .control-btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 20px rgba(0, 255, 136, 0.4);
+        }
+        .control-btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            transform: none;
+        }
+        
         /* Responsive */
         @media (max-width: 768px) {
             h1 {
@@ -1037,10 +1311,61 @@ HTML_TEMPLATE = """
         </div>
     </div>
     
+    <!-- Control Panel -->
+    <div class="pipeline-section">
+        <div class="pipeline-title">🎮 Control Panel</div>
+        <div style="display: flex; gap: 15px; flex-wrap: wrap; justify-content: center; margin-top: 20px;">
+            <button class="control-btn" id="pauseBtn" onclick="togglePause()">⏸ Pause</button>
+            <button class="control-btn" id="stopBtn" onclick="stopProject()" style="background: linear-gradient(135deg, #ff4444 0%, #cc0000 100%);">⏹ Stop Project</button>
+            <button class="control-btn" onclick="window.location.reload()">🔄 Refresh</button>
+        </div>
+        <div id="controlStatus" style="text-align: center; margin-top: 15px; font-size: 1.2em; color: #00ff88;"></div>
+    </div>
+    
     <div class="camera-container">
-        <div class="camera-box">
-            <h2>📹 Camera Feed</h2>
-            <img src="/video_feed/0" alt="Camera 0">
+        <div class="camera-box" id="camera0-box">
+            <h2>📹 Camera 0 (Primary)</h2>
+            <img src="/video_feed/0" alt="Camera 0" style="border-radius: 10px;">
+            <div style="margin-top: 15px; display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px;">
+                <div style="background: rgba(0,0,0,0.3); padding: 10px; border-radius: 5px;">
+                    <div style="font-size: 0.85em; opacity: 0.7;">Status</div>
+                    <div id="cam0-status" style="font-weight: bold; color: #00ff88;">IDLE</div>
+                </div>
+                <div style="background: rgba(0,0,0,0.3); padding: 10px; border-radius: 5px;">
+                    <div style="font-size: 0.85em; opacity: 0.7;">Detections</div>
+                    <div id="cam0-detections" style="font-weight: bold; color: #00ff88;">0</div>
+                </div>
+                <div style="background: rgba(0,0,0,0.3); padding: 10px; border-radius: 5px;">
+                    <div style="font-size: 0.85em; opacity: 0.7;">Confidence</div>
+                    <div id="cam0-confidence" style="font-weight: bold;">0.00</div>
+                </div>
+                <div style="background: rgba(0,0,0,0.3); padding: 10px; border-radius: 5px;">
+                    <div style="font-size: 0.85em; opacity: 0.7;">Total Cracks</div>
+                    <div id="cam0-total" style="font-weight: bold; color: #ff4444;">0</div>
+                </div>
+            </div>
+        </div>
+        <div class="camera-box" id="camera1-box" style="display: none;">
+            <h2>📹 Camera 1 (Secondary)</h2>
+            <img src="/video_feed/1" alt="Camera 1" style="border-radius: 10px;">
+            <div style="margin-top: 15px; display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px;">
+                <div style="background: rgba(0,0,0,0.3); padding: 10px; border-radius: 5px;">
+                    <div style="font-size: 0.85em; opacity: 0.7;">Status</div>
+                    <div id="cam1-status" style="font-weight: bold; color: #00ff88;">IDLE</div>
+                </div>
+                <div style="background: rgba(0,0,0,0.3); padding: 10px; border-radius: 5px;">
+                    <div style="font-size: 0.85em; opacity: 0.7;">Detections</div>
+                    <div id="cam1-detections" style="font-weight: bold; color: #00ff88;">0</div>
+                </div>
+                <div style="background: rgba(0,0,0,0.3); padding: 10px; border-radius: 5px;">
+                    <div style="font-size: 0.85em; opacity: 0.7;">Confidence</div>
+                    <div id="cam1-confidence" style="font-weight: bold;">0.00</div>
+                </div>
+                <div style="background: rgba(0,0,0,0.3); padding: 10px; border-radius: 5px;">
+                    <div style="font-size: 0.85em; opacity: 0.7;">Total Cracks</div>
+                    <div id="cam1-total" style="font-weight: bold; color: #ff4444;">0</div>
+                </div>
+            </div>
         </div>
     </div>
     
@@ -1147,9 +1472,100 @@ HTML_TEMPLATE = """
                 .catch(error => console.error('Error fetching crack data:', error));
         }
         
+        // Update system status and camera feeds
+        function updateSystemStatus() {
+            fetch('/api/system_status')
+                .then(response => response.json())
+                .then(data => {
+                    // Update camera 0 if active
+                    if (data.cameras.camera0) {
+                        const cam0 = data.cameras.camera0;
+                        document.getElementById('cam0-status').textContent = cam0.status.toUpperCase();
+                        document.getElementById('cam0-detections').textContent = cam0.count;
+                        document.getElementById('cam0-confidence').textContent = cam0.confidence.toFixed(2);
+                        document.getElementById('cam0-total').textContent = cam0.total_cracks;
+                        
+                        if (cam0.crack_detected) {
+                            document.getElementById('cam0-status').style.color = '#ff4444';
+                            document.getElementById('cam0-detections').style.color = '#ff4444';
+                        } else {
+                            document.getElementById('cam0-status').style.color = '#00ff88';
+                            document.getElementById('cam0-detections').style.color = '#00ff88';
+                        }
+                    }
+                    
+                    // Update camera 1 if active
+                    if (data.cameras.camera1) {
+                        document.getElementById('camera1-box').style.display = 'block';
+                        const cam1 = data.cameras.camera1;
+                        document.getElementById('cam1-status').textContent = cam1.status.toUpperCase();
+                        document.getElementById('cam1-detections').textContent = cam1.count;
+                        document.getElementById('cam1-confidence').textContent = cam1.confidence.toFixed(2);
+                        document.getElementById('cam1-total').textContent = cam1.total_cracks;
+                        
+                        if (cam1.crack_detected) {
+                            document.getElementById('cam1-status').style.color = '#ff4444';
+                            document.getElementById('cam1-detections').style.color = '#ff4444';
+                        } else {
+                            document.getElementById('cam1-status').style.color = '#00ff88';
+                            document.getElementById('cam1-detections').style.color = '#00ff88';
+                        }
+                    }
+                    
+                    // Update control status
+                    if (data.paused) {
+                        document.getElementById('controlStatus').textContent = '⏸ PAUSED';
+                        document.getElementById('controlStatus').style.color = '#ffaa00';
+                        document.getElementById('pauseBtn').textContent = '▶ Resume';
+                    } else if (data.started) {
+                        document.getElementById('controlStatus').textContent = '▶ RUNNING';
+                        document.getElementById('controlStatus').style.color = '#00ff88';
+                        document.getElementById('pauseBtn').textContent = '⏸ Pause';
+                    }
+                })
+                .catch(error => console.error('Error fetching system status:', error));
+        }
+        
+        // Control functions
+        let isPaused = false;
+        
+        function togglePause() {
+            fetch('/api/pause_project', { method: 'POST' })
+                .then(response => response.json())
+                .then(data => {
+                    if (data.status === 'success') {
+                        isPaused = !isPaused;
+                        updateSystemStatus();
+                    } else {
+                        alert('Error: ' + (data.error || data.message));
+                    }
+                })
+                .catch(error => alert('Error toggling pause: ' + error));
+        }
+        
+        function stopProject() {
+            if (!confirm('Are you sure you want to stop the inspection? This will end the current session.')) {
+                return;
+            }
+            
+            fetch('/api/stop_project', { method: 'POST' })
+                .then(response => response.json())
+                .then(data => {
+                    if (data.status === 'success') {
+                        alert('Project stopped. Reloading...');
+                        window.location.reload();
+                    } else {
+                        alert('Error: ' + (data.error || data.message));
+                    }
+                })
+                .catch(error => alert('Error stopping project: ' + error));
+        }
+        
         // Update every 2 seconds
         updatePipeline();
+        updateSystemStatus();
         setInterval(updatePipeline, 2000);
+        setInterval(updateSystemStatus, 1000);
     </script>
 </body>
 </html>
@@ -1158,23 +1574,194 @@ HTML_TEMPLATE = """
 
 @app.route('/')
 def index():
-    return render_template_string(HTML_TEMPLATE)
+    with config_lock:
+        if not project_config["initialized"]:
+            return render_template_string(CONFIG_TEMPLATE)
+        else:
+            return render_template_string(HTML_TEMPLATE)
+
+
+@app.route('/api/config', methods=['GET', 'POST'])
+def handle_config():
+    global cam0, cam1, project_config, PIPELINE_LENGTH_METERS, ESTIMATED_INSPECTION_DURATION_SEC
+    
+    if request.method == 'POST':
+        data = request.json
+        with config_lock:
+            project_config["pipeline_length"] = float(data.get('pipeline_length', 100.0))
+            project_config["inspection_duration"] = float(data.get('inspection_duration', 600.0))
+            project_config["enable_camera0"] = data.get('enable_camera0', True)
+            project_config["enable_camera1"] = data.get('enable_camera1', True)
+            project_config["initialized"] = True
+            
+            # Update global settings
+            PIPELINE_LENGTH_METERS = project_config["pipeline_length"]
+            ESTIMATED_INSPECTION_DURATION_SEC = project_config["inspection_duration"]
+            
+        return jsonify({"status": "success", "message": "Configuration saved"})
+    else:
+        with config_lock:
+            return jsonify(project_config)
+
+
+@app.route('/api/start_project', methods=['POST'])
+def start_project():
+    global cam0, cam1, project_config
+    
+    with config_lock:
+        if not project_config["initialized"]:
+            return jsonify({"error": "Project not configured"}), 400
+        
+        if project_config["started"]:
+            return jsonify({"error": "Project already started"}), 400
+        
+        # Initialize cameras
+        cam0 = CameraState(0, FOUND_DIR_CAM0, REALTIME_FOUND_DIR_CAM0)
+        if project_config["enable_camera1"]:
+            cam1 = CameraState(1, FOUND_DIR_CAM1, REALTIME_FOUND_DIR_CAM1)
+        else:
+            cam1 = None
+        
+        # Start camera 0 if enabled
+        if project_config["enable_camera0"]:
+            t_cap0 = threading.Thread(target=camera_capture_thread, args=(cam0, CAMERA_0_ID), daemon=True)
+            t_inf0 = threading.Thread(target=inference_loop, args=(cam0,), daemon=True)
+            t_cap0.start()
+            t_inf0.start()
+        
+        # Start camera 1 if enabled
+        if project_config["enable_camera1"] and cam1 is not None:
+            t_cap1 = threading.Thread(target=camera_capture_thread, args=(cam1, CAMERA_1_ID), daemon=True)
+            t_inf1 = threading.Thread(target=inference_loop, args=(cam1,), daemon=True)
+            t_cap1.start()
+            t_inf1.start()
+        
+        # Start dashboard
+        active_cams = [c for c in [cam0, cam1] if c is not None]
+        if active_cams:
+            t_dash = threading.Thread(target=dashboard_thread, args=(active_cams,), daemon=True)
+            t_dash.start()
+        
+        project_config["started"] = True
+        project_config["paused"] = False
+        
+    return jsonify({"status": "success", "message": "Project started"})
+
+
+@app.route('/api/pause_project', methods=['POST'])
+def pause_project():
+    global project_config
+    
+    with config_lock:
+        if not project_config["started"]:
+            return jsonify({"error": "Project not started"}), 400
+        
+        project_config["paused"] = not project_config["paused"]
+        
+        # Pause all active cameras
+        if cam0 is not None:
+            cam0.stop_flag = project_config["paused"]
+        if cam1 is not None:
+            cam1.stop_flag = project_config["paused"]
+        
+        status = "paused" if project_config["paused"] else "resumed"
+        return jsonify({"status": "success", "message": f"Project {status}"})
+
+
+@app.route('/api/stop_project', methods=['POST'])
+def stop_project():
+    global cam0, cam1, project_config
+    
+    with config_lock:
+        if not project_config["started"]:
+            return jsonify({"error": "Project not started"}), 400
+        
+        # Stop all cameras
+        if cam0 is not None:
+            cam0.stop_flag = True
+            cam0.close_csv()
+        if cam1 is not None:
+            cam1.stop_flag = True
+            cam1.close_csv()
+        
+        project_config["started"] = False
+        project_config["paused"] = False
+        
+    return jsonify({"status": "success", "message": "Project stopped"})
+
+
+@app.route('/api/system_status')
+def system_status():
+    """Get overall system status"""
+    status = {
+        "initialized": project_config["initialized"],
+        "started": project_config["started"],
+        "paused": project_config["paused"],
+        "pipeline_length": project_config["pipeline_length"],
+        "inspection_duration": project_config["inspection_duration"],
+        "cameras": {}
+    }
+    
+    if cam0 is not None:
+        with cam0.result_lock:
+            cam0_result = dict(cam0.latest_result)
+        with cam0.stats_lock:
+            cam0_stats = dict(cam0.stats)
+        
+        status["cameras"]["camera0"] = {
+            "active": project_config["enable_camera0"],
+            "status": cam0_result.get("status", "unknown"),
+            "crack_detected": cam0_result.get("count", 0) > 0,
+            "confidence": cam0_result.get("best", 0.0),
+            "count": cam0_result.get("count", 0),
+            "position": cam0.get_estimated_position() if ENABLE_POSITION_TRACKING else 0,
+            "total_cracks": cam0.crack_counter,
+            "stats": cam0_stats
+        }
+    
+    if cam1 is not None and project_config["enable_camera1"]:
+        with cam1.result_lock:
+            cam1_result = dict(cam1.latest_result)
+        with cam1.stats_lock:
+            cam1_stats = dict(cam1.stats)
+        
+        status["cameras"]["camera1"] = {
+            "active": project_config["enable_camera1"],
+            "status": cam1_result.get("status", "unknown"),
+            "crack_detected": cam1_result.get("count", 0) > 0,
+            "confidence": cam1_result.get("best", 0.0),
+            "count": cam1_result.get("count", 0),
+            "position": cam1.get_estimated_position() if ENABLE_POSITION_TRACKING else 0,
+            "total_cracks": cam1.crack_counter,
+            "stats": cam1_stats
+        }
+    
+    return jsonify(status)
 
 
 @app.route('/api/cracks')
 def get_cracks():
-    """API endpoint to get all detected cracks"""
-    if cam0 is None:
-        return jsonify({"error": "Camera not initialized"}), 500
+    """API endpoint to get all detected cracks from both cameras"""
+    all_cracks = []
     
-    cracks = cam0.get_crack_history()
-    current_position = cam0.get_estimated_position()
+    if cam0 is not None:
+        cracks = cam0.get_crack_history()
+        all_cracks.extend(cracks)
+    
+    if cam1 is not None:
+        cracks = cam1.get_crack_history()
+        all_cracks.extend(cracks)
+    
+    # Sort by position
+    all_cracks.sort(key=lambda x: x.get('position_m', 0))
+    
+    current_position = cam0.get_estimated_position() if cam0 else 0
     
     return jsonify({
         "pipeline_length_m": PIPELINE_LENGTH_METERS,
         "current_position_m": current_position,
-        "total_cracks": len(cracks),
-        "cracks": cracks,
+        "total_cracks": len(all_cracks),
+        "cracks": all_cracks,
     })
 
 
@@ -1194,7 +1781,21 @@ def get_crack_image(camera_id, crack_id):
 
 
 def generate_frames(cam_state: CameraState):
-    while True:
+    """Generate frames from camera state, handling None case"""
+    if cam_state is None:
+        # Return placeholder image
+        while True:
+            placeholder = np.zeros((480, 640, 3), dtype=np.uint8)
+            cv2.putText(placeholder, "Camera Not Active", (150, 240), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+            ret, buffer = cv2.imencode('.jpg', placeholder)
+            if ret:
+                frame_bytes = buffer.tobytes()
+                yield (b'--frame\r\n'
+                       b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+            time.sleep(1)
+    
+    while not cam_state.stop_flag:
         with cam_state.annotated_lock:
             frame = cam_state.latest_annotated_frame
         
@@ -1225,74 +1826,89 @@ def video_feed(cam_id):
 def main():
     global cam0, cam1
     
-    print("=" * 60)
-    print("  Pi 5 SINGLE CSI Camera Crack Detection (WEB STREAMING)")
-    print("=" * 60)
-    print(f"  Camera 0 rpicam id : {CAMERA_0_ID}")
-    print(f"  Camera 1           : DISABLED (not connected)")
+    print("=" * 70)
+    print("  Pi 5 Dual CSI Camera Crack Detection System (WEB CONTROL)")
+    print("=" * 70)
     print(f"  Flask web server   : http://0.0.0.0:{FLASK_PORT}")
     print(f"  Access from browser: http://<pi-ip>:{FLASK_PORT}")
+    print(f"  Camera 0 ID        : {CAMERA_0_ID}")
+    print(f"  Camera 1 ID        : {CAMERA_1_ID}")
+    print("\n  📋 SETUP INSTRUCTIONS:")
+    print("  1. Open the web interface in your browser")
+    print("  2. Configure pipeline parameters")
+    print("  3. Select which cameras to use")
+    print("  4. Click 'Start Inspection System'")
+    print("  5. Monitor and control from the dashboard")
     
     if ENABLE_POSITION_TRACKING:
-        print("\n  PIPELINE LOCALIZATION ENABLED")
-        print(f"  Pipeline Length:   {PIPELINE_LENGTH_METERS:.1f}m")
-        print(f"  Est. Duration:     {ESTIMATED_INSPECTION_DURATION_SEC:.0f}s ({ESTIMATED_INSPECTION_DURATION_SEC/60:.1f} min)")
-        print(f"  Position Estimate: Based on elapsed time (approx. constant speed)")
-        print("  IMPORTANT: This is an APPROXIMATE estimate, not precise odometry!")
+        print("\n  📍 PIPELINE LOCALIZATION ENABLED")
+        print(f"  Default Pipeline Length:   {PIPELINE_LENGTH_METERS:.1f}m")
+        print(f"  Default Est. Duration:     {ESTIMATED_INSPECTION_DURATION_SEC:.0f}s ({ESTIMATED_INSPECTION_DURATION_SEC/60:.1f} min)")
+        print("  Position tracking based on elapsed time (approximate)")
     
-    print("=" * 60)
-    print("Press Ctrl+C to stop.\n")
+    print("=" * 70)
+    print("\nPress Ctrl+C to stop.\n")
 
-    cam0 = CameraState(0, FOUND_DIR_CAM0, REALTIME_FOUND_DIR_CAM0)
-    cam1 = CameraState(1, FOUND_DIR_CAM1, REALTIME_FOUND_DIR_CAM1)  # Dummy, not used
-
-    # Only start Camera 0 threads
-    t_cap0 = threading.Thread(target=camera_capture_thread, args=(cam0, CAMERA_0_ID), daemon=True)
-    t_inf0 = threading.Thread(target=inference_loop, args=(cam0,), daemon=True)
-    t_dash = threading.Thread(target=dashboard_thread, args=([cam0],), daemon=True)  # Only cam0 in dashboard
-
-    t_cap0.start()
-    t_inf0.start()
-    t_dash.start()
-
+    # Start Flask web server - cameras will be started via web interface
     try:
         app.run(host=FLASK_HOST, port=FLASK_PORT, debug=False, threaded=True)
     except KeyboardInterrupt:
         pass
     finally:
         print("\nStopping...")
-        cam0.stop_flag = True
+        
+        # Stop and close all cameras if they were started
+        if cam0 is not None:
+            cam0.stop_flag = True
+            cam0.close_csv()
+        if cam1 is not None:
+            cam1.stop_flag = True
+            cam1.close_csv()
+        
         time.sleep(0.5)
-        
-        # Close CSV files
-        cam0.close_csv()
 
-        print("\n" + "=" * 60)
+        print("\n" + "=" * 70)
         print("  FINAL STATS - PIPELINE INSPECTION")
-        print("=" * 60)
+        print("=" * 70)
         
-        if ENABLE_POSITION_TRACKING:
+        # Show camera 0 stats if it was initialized
+        if cam0 is not None and ENABLE_POSITION_TRACKING:
             elapsed = cam0.get_elapsed_time()
             final_position = cam0.get_estimated_position()
             print(f"\n  Pipeline Length:   {PIPELINE_LENGTH_METERS:.1f}m")
             print(f"  Inspection Time:   {elapsed:.1f}s ({elapsed/60:.1f} min)")
             print(f"  Final Position:    {final_position:.2f}m")
-            print(f"  Total Cracks:      {cam0.crack_counter}")
+            print(f"  Camera 0 Cracks:   {cam0.crack_counter}")
+            if cam1 is not None:
+                print(f"  Camera 1 Cracks:   {cam1.crack_counter}")
+                print(f"  Total Cracks:      {cam0.crack_counter + cam1.crack_counter}")
         
-        with cam0.stats_lock:
-            s = dict(cam0.stats)
-        print(f"\n  Camera 0:")
-        print(f"    Total Frames:      {s['total_frames']}")
-        print(f"    Processed:         {s['processed_frames']}")
-        print(f"    Saved:             {s['total_saved']}")
-        print(f"    Errors:            {s['inference_errors']}")
-        print(f"    Severity: Critical={s['critical_cracks']} High={s['high_cracks']} "\
-              f"Medium={s['medium_cracks']} Low={s['low_cracks']}")
+        if cam0 is not None:
+            with cam0.stats_lock:
+                s = dict(cam0.stats)
+            print(f"\n  Camera 0:")
+            print(f"    Total Frames:      {s['total_frames']}")
+            print(f"    Processed:         {s['processed_frames']}")
+            print(f"    Saved:             {s['total_saved']}")
+            print(f"    Errors:            {s['inference_errors']}")
+            print(f"    Severity: Critical={s['critical_cracks']} High={s['high_cracks']} "
+                  f"Medium={s['medium_cracks']} Low={s['low_cracks']}")
         
-        if ENABLE_POSITION_TRACKING:
-            print(f"\n  CSV Report: {REPORTS_DIR}/cam0_crack_report_*.csv")
+        if cam1 is not None:
+            with cam1.stats_lock:
+                s = dict(cam1.stats)
+            print(f"\n  Camera 1:")
+            print(f"    Total Frames:      {s['total_frames']}")
+            print(f"    Processed:         {s['processed_frames']}")
+            print(f"    Saved:             {s['total_saved']}")
+            print(f"    Errors:            {s['inference_errors']}")
+            print(f"    Severity: Critical={s['critical_cracks']} High={s['high_cracks']} "
+                  f"Medium={s['medium_cracks']} Low={s['low_cracks']}")
         
-        print("\n" + "=" * 60)
+        if ENABLE_POSITION_TRACKING and cam0 is not None:
+            print(f"\n  CSV Reports: {REPORTS_DIR}/")
+        
+        print("\n" + "=" * 70)
         print("Done.")
 
 
