@@ -1378,6 +1378,29 @@ HTML_TEMPLATE = """
             background:rgba(0,255,136,0.1);
             box-shadow:0 0 15px rgba(0,255,136,0.3);
         }
+        
+        /* Unit Selectors */
+        .unit-controls {
+            display:flex; gap:15px; justify-content:center;
+            margin-top:15px; flex-wrap:wrap;
+        }
+        .unit-group {
+            display:flex; flex-direction:column; align-items:center;
+        }
+        .unit-label {
+            font-size:0.85em; color:#00ff88; margin-bottom:5px;
+            opacity:0.8;
+        }
+        .unit-selector {
+            padding:8px 15px; border-radius:6px;
+            border:2px solid #00ff88; background:rgba(0,0,0,0.3);
+            color:#00ff88; font-size:0.9em; font-weight:bold;
+            cursor:pointer; transition:all 0.3s;
+        }
+        .unit-selector:hover {
+            background:rgba(0,255,136,0.1);
+            box-shadow:0 0 10px rgba(0,255,136,0.3);
+        }
     </style>
 </head>
 <body>
@@ -1388,6 +1411,24 @@ HTML_TEMPLATE = """
             <option value="metal">Metal Pipe Model (68% mAP)</option>
             <option value="pvc">PVC Trained Model (35% mAP)</option>
         </select>
+        <div class="unit-controls">
+            <div class="unit-group">
+                <div class="unit-label">Length Unit</div>
+                <select class="unit-selector" id="length-unit" onchange="updateUnits()">
+                    <option value="m" selected>Meters (m)</option>
+                    <option value="cm">Centimeters (cm)</option>
+                    <option value="km">Kilometers (km)</option>
+                </select>
+            </div>
+            <div class="unit-group">
+                <div class="unit-label">Velocity Unit</div>
+                <select class="unit-selector" id="velocity-unit" onchange="updateUnits()">
+                    <option value="m/s" selected>m/s</option>
+                    <option value="mm/s">mm/s</option>
+                    <option value="km/h">km/h</option>
+                </select>
+            </div>
+        </div>
     </div>
 
     <div class="stats-bar">
@@ -1507,11 +1548,44 @@ HTML_TEMPLATE = """
         window.onclick = e => { if (e.target === modal) modal.style.display = 'none'; };
         const pipelineContainer = document.getElementById('pipeline-container');
 
+        // Unit conversion functions
+        function convertLength(meters, unit) {
+            switch(unit) {
+                case 'cm': return meters * 100;
+                case 'km': return meters / 1000;
+                default: return meters; // m
+            }
+        }
+
+        function convertVelocity(metersPerSec, unit) {
+            switch(unit) {
+                case 'mm/s': return metersPerSec * 1000;
+                case 'km/h': return metersPerSec * 3.6;
+                default: return metersPerSec; // m/s
+            }
+        }
+
+        function getLengthUnit() {
+            return document.getElementById('length-unit').value;
+        }
+
+        function getVelocityUnit() {
+            return document.getElementById('velocity-unit').value;
+        }
+
+        function updateUnits() {
+            // Re-fetch and update display with new units
+            updatePipeline();
+        }
+
         function showCrackDetail(crack) {
+            const lengthUnit = getLengthUnit();
+            const convertedPosition = convertLength(crack.position_m, lengthUnit);
+            
             document.getElementById('modal-title').textContent = `Crack #${crack.crack_id} Details`;
             document.getElementById('modal-image').src = `/crack_image/${crack.crack_id}`;
             document.getElementById('modal-crack-id').textContent = crack.crack_id;
-            document.getElementById('modal-position').textContent = crack.position_m.toFixed(2) + ' m';
+            document.getElementById('modal-position').textContent = convertedPosition.toFixed(lengthUnit === 'km' ? 3 : 2) + ' ' + lengthUnit;
             document.getElementById('modal-confidence').textContent = (crack.confidence * 100).toFixed(1) + '%';
             document.getElementById('modal-area').textContent = Math.round(crack.area_px) + ' px²';
             document.getElementById('modal-time').textContent = crack.timestamp_str;
@@ -1526,9 +1600,15 @@ HTML_TEMPLATE = """
                 .then(data => {
                     const plen = data.pipeline_length_m;
                     const cracks = data.cracks;
-                    document.getElementById('pipeline-length').textContent = plen.toFixed(1) + 'm';
-                    document.getElementById('pipeline-end').textContent = plen.toFixed(0) + 'm';
-                    document.getElementById('current-position').textContent = data.current_position_m.toFixed(2) + 'm';
+                    const lengthUnit = getLengthUnit();
+                    const velocityUnit = getVelocityUnit();
+                    
+                    const convertedLength = convertLength(plen, lengthUnit);
+                    const convertedPosition = convertLength(data.current_position_m, lengthUnit);
+                    
+                    document.getElementById('pipeline-length').textContent = convertedLength.toFixed(lengthUnit === 'km' ? 3 : lengthUnit === 'cm' ? 0 : 1) + lengthUnit;
+                    document.getElementById('pipeline-end').textContent = convertedLength.toFixed(0) + lengthUnit;
+                    document.getElementById('current-position').textContent = convertedPosition.toFixed(lengthUnit === 'km' ? 3 : 2) + lengthUnit;
                     document.getElementById('total-cracks').textContent = cracks.length;
                     document.getElementById('cam0-total').textContent = cracks.length;
 
@@ -1536,8 +1616,9 @@ HTML_TEMPLATE = """
                     document.getElementById('cam0-progress').textContent = prog + '%';
 
                     if (data.robot_velocity !== undefined) {
+                        const convertedVelocity = convertVelocity(data.robot_velocity, velocityUnit);
                         document.getElementById('robot-velocity').textContent =
-                            (data.robot_velocity * 3.6).toFixed(2) + ' km/h';
+                            convertedVelocity.toFixed(velocityUnit === 'km/h' ? 2 : velocityUnit === 'mm/s' ? 0 : 2) + ' ' + velocityUnit;
                     }
                     if (data.model_id) {
                         document.getElementById('model-name').textContent =
