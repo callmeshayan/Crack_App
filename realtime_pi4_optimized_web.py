@@ -235,7 +235,12 @@ API_KEY = RF_API_KEY
 
 # Offline mode: Local YOLO
 LOCAL_MODEL_PATH = os.getenv("LOCAL_MODEL_PATH", "models/best.pt")
+PVC_MODEL_PATH = os.getenv("PVC_MODEL_PATH", "models/yolo11n_pvc_trained_best.pt")
 YOLO_DEVICE = os.getenv("YOLO_DEVICE", "cpu")
+
+# Model storage for dynamic switching
+available_models = {}
+current_model_type = "metal"  # default
 
 # Initialize model based on mode (lenient — crashes handled at runtime)
 client = None
@@ -263,7 +268,14 @@ elif MODEL_MODE == "offline":
     else:
         try:
             local_model = YOLO(LOCAL_MODEL_PATH)
+            available_models['metal'] = local_model
             print(f"[INIT] On-Device AI Model initialized (YOLOv11n - 68% mAP)")
+            
+            # Load PVC model if available
+            if Path(PVC_MODEL_PATH).exists():
+                pvc_model = YOLO(PVC_MODEL_PATH)
+                available_models['pvc'] = pvc_model
+                print(f"[INIT] PVC Trained Model also loaded (35% mAP)")
         except Exception as _e:
             print(f"WARNING: Could not load offline model: {_e}")
 else:
@@ -818,7 +830,9 @@ def _run_inference_and_log(frame, camera_name):
                 if 'class' in p and 'class_name' not in p:
                     p['class_name'] = p['class']
         elif MODEL_MODE == "offline" and local_model:
-            results = local_model(processed, conf=CONF_THRESH, device=YOLO_DEVICE, verbose=False)
+            # Use currently selected model
+            active_model = available_models.get(current_model_type, local_model)
+            results = active_model(processed, conf=CONF_THRESH, device=YOLO_DEVICE, verbose=False)
             preds = extract_predictions(results[0]) if len(results) > 0 else []
         else:
             preds = []
@@ -1351,12 +1365,29 @@ HTML_TEMPLATE = """
         }
         .control-btn:hover { transform:translateY(-2px);
                              box-shadow:0 5px 20px rgba(0,255,136,0.4); }
+        
+        /* Model Selector */
+        .model-selector {
+            padding:10px 20px; border-radius:8px;
+            border:2px solid #00ff88; background:rgba(0,0,0,0.3);
+            color:#00ff88; font-size:1em; font-weight:bold;
+            cursor:pointer; transition:all 0.3s;
+            margin-top:10px;
+        }
+        .model-selector:hover {
+            background:rgba(0,255,136,0.1);
+            box-shadow:0 0 15px rgba(0,255,136,0.3);
+        }
     </style>
 </head>
 <body>
     <div class="header">
         <h1>🔍 Pipeline Crack Detection System</h1>
         <p style="opacity:0.7;">Raspberry Pi 4 — Single Camera</p>
+        <select class="model-selector" id="model-selector" onchange="switchModel()">
+            <option value="metal">Metal Pipe Model (68% mAP)</option>
+            <option value="pvc">PVC Trained Model (35% mAP)</option>
+        </select>
     </div>
 
     <div class="stats-bar">
@@ -1593,6 +1624,32 @@ HTML_TEMPLATE = """
             }, 2500);
         }
 
+        function switchModel() {
+            const selector = document.getElementById('model-selector');
+            const modelType = selector.value;
+            
+            fetch('/switch_model', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({ model_type: modelType })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    console.log('Switched to ' + modelType + ' model');
+                } else {
+                    alert('Failed to switch model: ' + data.error);
+                    selector.value = data.current_model;
+                }
+            })
+            .catch(error => {
+                console.error('Error switching model:', error);
+                alert('Error switching model');
+            });
+        }
+
         updatePipeline();
         updateSystemStatus();
         setInterval(updatePipeline, 2000);
@@ -1788,6 +1845,42 @@ def system_status():
             "stats": {}
         }
     return jsonify(status)
+
+
+@app.route('/switch_model', methods=['POST'])
+def switch_model():
+    """Switch between metal pipe and PVC trained models"""
+    global current_model_type
+    
+    try:
+        data = request.get_json()
+        model_type = data.get('model_type', 'metal')
+        
+        # Validate model type
+        if model_type not in available_models:
+            return jsonify({
+                'success': False,
+                'error': f'Model type "{model_type}" not available',
+                'current_model': current_model_type
+            }), 400
+        
+        # Switch the model
+        current_model_type = model_type
+        print(f"[INFO] Switched to {model_type} model")
+        
+        return jsonify({
+            'success': True,
+            'current_model': current_model_type,
+            'message': f'Successfully switched to {model_type} model'
+        })
+    
+    except Exception as e:
+        print(f"[ERROR] Model switch failed: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e),
+            'current_model': current_model_type
+        }), 500
 
 
 @app.route('/api/cracks')
