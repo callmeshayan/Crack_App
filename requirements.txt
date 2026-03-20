@@ -7,7 +7,7 @@ reportlab>=4.0.0
 pillow>=10.0.0
 
 # For online mode (Roboflow Rapid API)
-inference-sdk>=0.9.0
+# inference-sdk>=0.9.0  # Note: Not compatible with Python 3.13
 
 # For offline mode (Local YOLO model)
 ultralytics>=8.0.0

@@ -30,13 +30,43 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.enums import TA_CENTER, TA_LEFT
 from PIL import Image as PILImage
 
-# Conditional imports for online/offline models
+# Picamera2 for Pi CSI camera (libcamera / imx708 / Module 3)
 try:
-    from inference_sdk import InferenceHTTPClient
-    ROBOFLOW_AVAILABLE = True
+    from picamera2 import Picamera2
+    PICAMERA2_AVAILABLE = True
 except ImportError:
-    ROBOFLOW_AVAILABLE = False
-    print("Warning: inference_sdk not available. Only offline mode will work.")
+    PICAMERA2_AVAILABLE = False
+    print("Warning: picamera2 not available. Will try cv2.VideoCapture fallback.")
+
+# Conditional imports for online/offline models
+# inference_sdk does not support Python 3.13 — use direct HTTP instead
+import base64 as _b64mod
+import requests as _requests
+
+ROBOFLOW_AVAILABLE = True  # always available via direct HTTP
+
+class InferenceHTTPClient:
+    """Minimal Roboflow workflow client using plain requests (no inference_sdk)."""
+    def __init__(self, api_url: str, api_key: str):
+        self.api_url = api_url.rstrip('/')
+        self.api_key = api_key
+
+    def run_workflow(self, workspace_name: str, workflow_id: str, images: dict) -> list:
+        url = f"{self.api_url}/infer/workflows/{workspace_name}/{workflow_id}"
+        # Build image inputs
+        inputs = {}
+        for key, value in images.items():
+            if isinstance(value, bytes):
+                b64 = _b64mod.b64encode(value).decode('utf-8')
+            else:
+                b64 = value
+            inputs[key] = {"type": "base64", "value": b64}
+        payload = {"inputs": inputs, "api_key": self.api_key}
+        resp = _requests.post(url, json=payload, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        # Return outputs list (same shape as inference_sdk)
+        return data.get("outputs", [data])
 
 try:
     from ultralytics import YOLO
@@ -102,19 +132,8 @@ def get_operator_input():
             break
         print("Invalid choice. Please enter 1 or 2.")
     
-    # Camera mode selection for Pi 4
-    camera_mode = "dual"
-    if IS_PI4:
-        print("\nCAMERA CONFIGURATION:")
-        print("  1. Single Camera Mode (Better performance, recommended for Pi 4)")
-        print("  2. Dual Camera Mode (Requires camera multiplexer or USB cameras)")
-        
-        while True:
-            cam_choice = input(f"\nEnter choice [1/2] (default: 1): ").strip() or "1"
-            if cam_choice in ["1", "2"]:
-                camera_mode = "single" if cam_choice == "1" else "dual"
-                break
-            print("Invalid choice. Please enter 1 or 2.")
+    # Pi 4 has only one on-board CSI camera connector — always single camera
+    camera_mode = "single"
     
     # Pipeline length
     default_length = os.getenv("PIPELINE_LENGTH", "100.0")
@@ -160,7 +179,7 @@ def get_operator_input():
     model_name = "On-Device AI Model (YOLOv11n - 68% mAP)" if model_mode == "offline" else "Cloud-Based AI Model (Roboflow API)"
     print(f"  Detection Model:  {model_name}")
     if IS_PI4:
-        print(f"  Camera Mode:      {'Single Camera' if camera_mode == 'single' else 'Dual Camera'}")
+        print(f"  Camera Mode:      Single Camera (on-board CSI)")
         print(f"  Hardware:         Raspberry Pi 4 (Optimized)")
     print(f"  Pipeline Length:  {pipeline_length:.2f} meters")
     print(f"  Robot Velocity:   {velocity:.2f} {velocity_unit}")
@@ -192,16 +211,20 @@ def get_operator_input():
     }
 
 # Get operator input
-operator_config = get_operator_input()
-
-# Apply operator configuration
-MODEL_MODE = operator_config['model_mode']
-CAMERA_MODE = operator_config.get('camera_mode', 'dual')
-PIPELINE_LENGTH_METERS = operator_config['pipeline_length']
-ROBOT_VELOCITY = operator_config['velocity']
-VELOCITY_UNIT = operator_config['velocity_unit']
-ROBOT_VELOCITY_MPS = operator_config['velocity_mps']
-ESTIMATED_INSPECTION_DURATION_SEC = PIPELINE_LENGTH_METERS / ROBOT_VELOCITY_MPS if ROBOT_VELOCITY_MPS > 0 else 0
+# Configuration from environment — operator configures via web UI at runtime
+MODEL_MODE = os.getenv("MODEL_MODE", "offline").strip().lower()
+CAMERA_MODE = "single"  # Pi 4 has one on-board CSI connector
+_default_velocity = float(os.getenv("ROBOT_VELOCITY", "0.167"))
+VELOCITY_UNIT = os.getenv("VELOCITY_UNIT", "m/s").lower()
+ROBOT_VELOCITY = _default_velocity
+if VELOCITY_UNIT == "km/h":
+    ROBOT_VELOCITY_MPS = _default_velocity / 3.6
+else:
+    ROBOT_VELOCITY_MPS = _default_velocity
+PIPELINE_LENGTH_METERS = float(os.getenv("PIPELINE_LENGTH", "100.0"))
+ESTIMATED_INSPECTION_DURATION_SEC = (
+    PIPELINE_LENGTH_METERS / ROBOT_VELOCITY_MPS if ROBOT_VELOCITY_MPS > 0 else 600.0
+)
 
 # Online mode: Roboflow
 RF_API_URL = os.getenv("RF_API_URL", "https://detect.roboflow.com")
@@ -214,43 +237,46 @@ API_KEY = RF_API_KEY
 LOCAL_MODEL_PATH = os.getenv("LOCAL_MODEL_PATH", "models/best.pt")
 YOLO_DEVICE = os.getenv("YOLO_DEVICE", "cpu")
 
-# Initialize model based on mode
+# Initialize model based on mode (lenient — crashes handled at runtime)
 client = None
 local_model = None
 
 if MODEL_MODE == "online":
     if not ROBOFLOW_AVAILABLE:
-        raise ValueError("Online mode selected but inference-sdk not installed. Install with: pip install inference-sdk")
-    if not RF_API_KEY or not RF_WORKFLOW_ID:
-        raise ValueError("RF_API_KEY and RF_WORKFLOW_ID must be set in .env for online mode")
-    client = InferenceHTTPClient(
-        api_url="https://serverless.roboflow.com",
-        api_key=API_KEY,
-    )
-    print(f"[INIT] Cloud-Based AI Model initialized successfully")
+        print("WARNING: inference-sdk not installed; online mode unavailable.")
+    elif not RF_API_KEY:
+        print("WARNING: RF_API_KEY not set; online mode will fail until configured.")
+    else:
+        try:
+            client = InferenceHTTPClient(
+                api_url="https://serverless.roboflow.com",
+                api_key=API_KEY,
+            )
+            print("[INIT] Cloud-Based AI Model initialized successfully")
+        except Exception as _e:
+            print(f"WARNING: Could not init Roboflow client: {_e}")
 elif MODEL_MODE == "offline":
     if not ULTRALYTICS_AVAILABLE:
-        raise ValueError("Offline mode selected but ultralytics not installed. Install with: pip install ultralytics")
-    if not Path(LOCAL_MODEL_PATH).exists():
-        raise ValueError(f"Local model not found at: {LOCAL_MODEL_PATH}")
-    # Load model with CPU for Raspberry Pi 4 compatibility
-    local_model = YOLO(LOCAL_MODEL_PATH)
-    print(f"[INIT] On-Device AI Model initialized successfully (YOLOv11n - 68% mAP)")
-    print(f"[INIT] Model path: {LOCAL_MODEL_PATH}")
-    print(f"[INIT] Compute device: {YOLO_DEVICE.upper()}")
-    print(f"[INIT] Robot velocity: {ROBOT_VELOCITY} {VELOCITY_UNIT} ({ROBOT_VELOCITY_MPS:.3f} m/s)")
-    print(f"[INIT] Pipeline length: {PIPELINE_LENGTH_METERS}m")
-    print(f"[INIT] Estimated inspection time: {ESTIMATED_INSPECTION_DURATION_SEC:.1f}s ({ESTIMATED_INSPECTION_DURATION_SEC/60:.1f} min)")
+        print("WARNING: ultralytics not installed; offline model unavailable.")
+    elif not Path(LOCAL_MODEL_PATH).exists():
+        print(f"WARNING: Offline model not found at {LOCAL_MODEL_PATH}; will retry on start.")
+    else:
+        try:
+            local_model = YOLO(LOCAL_MODEL_PATH)
+            print(f"[INIT] On-Device AI Model initialized (YOLOv11n - 68% mAP)")
+        except Exception as _e:
+            print(f"WARNING: Could not load offline model: {_e}")
 else:
-    raise ValueError(f"Invalid MODEL_MODE: {MODEL_MODE}. Must be 'online' or 'offline'")
+    print(f"WARNING: Unknown MODEL_MODE '{MODEL_MODE}'; defaulting to offline.")
+    MODEL_MODE = "offline"
 
 # ---------------- OPTIMIZED SETTINGS FOR PI 4 ----------------
-CONF_THRESH = float(os.getenv("RF_CONF", "0.5"))
-INFER_FPS = 1.0
+CONF_THRESH = float(os.getenv("RF_CONF", "0.25"))
+INFER_FPS = 3.0
 SAVE_COOLDOWN_S = 0.5
 ONLY_CLASS = ""
 
-ENABLE_PREPROCESSING = True
+ENABLE_PREPROCESSING = False  # Heavy denoising masks crack features and slows Pi 4
 ENABLE_PERSISTENCE = False
 PERSISTENCE_FRAMES = 3
 BLUR_THRESHOLD = 5.0
@@ -270,7 +296,7 @@ if IS_PI4:
     CAMERA_WIDTH = 640   # Lower resolution for Pi 4
     CAMERA_HEIGHT = 480
     CAPTURE_FPS = 20     # Lower FPS for Pi 4
-    FRAME_SKIP = 2       # Process every 2nd frame on Pi 4
+    FRAME_SKIP = 1       # Process every frame on Pi 4
     print(f"[INIT] Pi 4 optimizations enabled: 640x480 @ 20fps, frame skip: {FRAME_SKIP}")
 else:
     CAMERA_WIDTH = 1280  # Higher resolution for Pi 5
@@ -279,7 +305,6 @@ else:
     FRAME_SKIP = 1       # Process every frame on Pi 5
 
 CAMERA_0_ID = int(os.getenv("CAM0_INDEX", "0"))
-CAMERA_1_ID = int(os.getenv("CAM1_INDEX", "1"))
 
 DASHBOARD_INTERVAL_S = 5.0
 
@@ -288,12 +313,10 @@ FLASK_PORT = 5000
 
 OUT_BASE = Path("data/realtime_results")
 FOUND_DIR_CAM0 = OUT_BASE / "camera0_found"
-FOUND_DIR_CAM1 = OUT_BASE / "camera1_found"
 REALTIME_FOUND_DIR_CAM0 = OUT_BASE / "camera0_realtime"
-REALTIME_FOUND_DIR_CAM1 = OUT_BASE / "camera1_realtime"
 REPORTS_DIR = OUT_BASE / "reports"
 
-for p in [FOUND_DIR_CAM0, FOUND_DIR_CAM1, REALTIME_FOUND_DIR_CAM0, REALTIME_FOUND_DIR_CAM1, REPORTS_DIR]:
+for p in [FOUND_DIR_CAM0, REALTIME_FOUND_DIR_CAM0, REPORTS_DIR]:
     p.mkdir(parents=True, exist_ok=True)
 
 
@@ -604,56 +627,61 @@ def preprocess_frame(frame: np.ndarray) -> np.ndarray:
 
 def extract_predictions(result: Any) -> List[Dict[str, Any]]:
     """
-    Extract prediction data from either Roboflow or YOLO result.
+    Extract prediction data from either Roboflow workflow or YOLO result.
     Returns list of dicts with keys: class_name, confidence, x, y, width, height
     """
-    predictions = []
-    
-    # Check if it's a YOLO Results object
+    # YOLO Results object
     if hasattr(result, 'boxes'):
-        # Ultralytics YOLO format
+        predictions = []
         boxes = result.boxes
-        if boxes is not None and len(boxes) > 0:
+        if boxes is not None:
             for box in boxes:
-                # Get box coordinates
-                xyxy = box.xyxy[0].cpu().numpy()  # [x1, y1, x2, y2]
+                xyxy = box.xyxy[0].cpu().numpy()
                 conf = float(box.conf[0].cpu().numpy())
                 cls = int(box.cls[0].cpu().numpy())
-                
-                # Convert to center format
                 x1, y1, x2, y2 = xyxy
-                x_center = (x1 + x2) / 2
-                y_center = (y1 + y2) / 2
-                width = x2 - x1
-                height = y2 - y1
-                
-                # Get class name from model
                 class_name = result.names[cls] if hasattr(result, 'names') else f"class_{cls}"
-                
                 predictions.append({
                     'class_name': class_name,
                     'confidence': conf,
-                    'x': float(x_center),
-                    'y': float(y_center),
-                    'width': float(width),
-                    'height': float(height)
+                    'x': float((x1 + x2) / 2),
+                    'y': float((y1 + y2) / 2),
+                    'width': float(x2 - x1),
+                    'height': float(y2 - y1)
                 })
-    
-    # Check if it's a Roboflow workflow result
-    elif isinstance(result, dict):
-        # Roboflow format
-        if 'output' in result and 'predictions' in result['output']:
-            for pred in result['output']['predictions']:
-                predictions.append({
-                    'class_name': pred.get('class', 'crack'),
-                    'confidence': pred.get('confidence', 0.0),
-                    'x': pred.get('x', 0),
-                    'y': pred.get('y', 0),
-                    'width': pred.get('width', 0),
-                    'height': pred.get('height', 0)
+        return predictions
+
+    # Roboflow workflow returns a list of output dicts
+    if isinstance(result, list):
+        for item in result:
+            preds = extract_predictions(item)
+            if preds:
+                return preds
+        return []
+
+    if isinstance(result, dict):
+        # Look for a 'predictions' key at any level
+        raw = result.get('predictions')
+        if isinstance(raw, list) and raw:
+            out = []
+            for p in raw:
+                out.append({
+                    'class_name': p.get('class', p.get('class_name', 'crack')),
+                    'confidence': float(p.get('confidence', 0.0)),
+                    'x': float(p.get('x', 0)),
+                    'y': float(p.get('y', 0)),
+                    'width': float(p.get('width', 0)),
+                    'height': float(p.get('height', 0))
                 })
-    
-    return predictions
+            return out
+        # Recurse into nested dicts
+        for v in result.values():
+            if isinstance(v, (dict, list)):
+                preds = extract_predictions(v)
+                if preds:
+                    return preds
+
+    return []
 
 
 # ---------------- GLOBAL STATE ----------------
@@ -672,13 +700,16 @@ with open(csv_path, "w", newline="") as f:
 crack_lock = threading.Lock()
 next_id = 1
 last_cam0_detect_t = 0.0
-last_cam1_detect_t = 0.0
 
-detection_flags = {"cam0": False, "cam1": False}
-flag_timers = {"cam0": 0.0, "cam1": 0.0}
+detection_flags = {"cam0": False}
+flag_timers = {"cam0": 0.0}
+cam0_boxes = []          # latest bounding boxes: list of (x1, y1, x2, y2, conf)
+cam0_boxes_lock = threading.Lock()
+cam0_boxes_expire = 0.0  # time after which boxes should be cleared
 
 # Inspection timing
 inspection_start_time = time.time()
+_app_start_time = time.time()  # used to show friendly "initializing" message on startup
 
 def set_flag(cam: str):
     detection_flags[cam] = True
@@ -687,9 +718,8 @@ def set_flag(cam: str):
 
 def update_flags():
     now = time.time()
-    for cam in ["cam0", "cam1"]:
-        if detection_flags[cam] and (now - flag_timers[cam] > BOOLEAN_DURATION_S):
-            detection_flags[cam] = False
+    if detection_flags["cam0"] and (now - flag_timers["cam0"] > BOOLEAN_DURATION_S):
+        detection_flags["cam0"] = False
 
 
 def log_detection(
@@ -699,7 +729,7 @@ def log_detection(
     x: float, y: float, w: float, h: float,
     img: Optional[np.ndarray] = None
 ):
-    global next_id, last_cam0_detect_t, last_cam1_detect_t
+    global next_id, last_cam0_detect_t
     
     now_t = time.time()
     elapsed_sec = now_t - inspection_start_time
@@ -713,14 +743,9 @@ def log_detection(
         progress_pct = 0.0
     
     # Apply cooldown
-    if camera == "CAM0":
-        if now_t - last_cam0_detect_t < SAVE_COOLDOWN_S:
-            return
-        last_cam0_detect_t = now_t
-    else:
-        if now_t - last_cam1_detect_t < SAVE_COOLDOWN_S:
-            return
-        last_cam1_detect_t = now_t
+    if now_t - last_cam0_detect_t < SAVE_COOLDOWN_S:
+        return
+    last_cam0_detect_t = now_t
     
     sev = parse_severity(conf)
     ts_str = time.strftime("%H:%M:%S")
@@ -747,12 +772,7 @@ def log_detection(
         # Save image with location indicator
         if img is not None:
             img_with_location = draw_location_indicator(img, position_m, PIPELINE_LENGTH_METERS, ts_str)
-            
-            if camera == "CAM0":
-                img_path = FOUND_DIR_CAM0 / f"crack_{det_id:04d}_{ts_str.replace(':', '')}.jpg"
-            else:
-                img_path = FOUND_DIR_CAM1 / f"crack_{det_id:04d}_{ts_str.replace(':', '')}.jpg"
-            
+            img_path = FOUND_DIR_CAM0 / f"crack_{det_id:04d}_{ts_str.replace(':', '')}.jpg"
             cv2.imwrite(str(img_path), img_with_location)
             det_record["image_path"] = str(img_path)
         
@@ -764,356 +784,597 @@ def log_detection(
                 f"{elapsed_sec:.2f}", f"{position_m:.2f}", f"{progress_pct:.1f}"
             ])
     
-    set_flag("cam0" if camera == "CAM0" else "cam1")
+    set_flag("cam0")
 
 
 # ---------------- CAMERA THREADS ----------------
 stop_event = threading.Event()
+cam_stop_event = threading.Event()   # stops camera capture (only on full app shutdown)
+inspection_paused = threading.Event()  # set = paused
 cam0_frame = None
-cam1_frame = None
 cam0_lock = threading.Lock()
-cam1_lock = threading.Lock()
+_cam0_thread_started = False
 
 frame_counter_cam0 = 0
-frame_counter_cam1 = 0
 
 
-def cam_loop(camera_id: int, camera_name: str, lock, global_frame_var: str):
-    """
-    Camera capture loop with frame skipping optimization for Pi 4.
-    """
-    global cam0_frame, cam1_frame, frame_counter_cam0, frame_counter_cam1
-    
-    cap = cv2.VideoCapture(camera_id)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
-    cap.set(cv2.CAP_PROP_FPS, CAPTURE_FPS)
-    
-    if not cap.isOpened():
-        print(f"[{camera_name}] Failed to open camera {camera_id}")
+def _run_inference_and_log(frame, camera_name):
+    """Run inference on a frame and log any detections."""
+    processed = preprocess_frame(frame)
+    gray = cv2.cvtColor(processed, cv2.COLOR_BGR2GRAY)
+    if compute_laplacian_variance(gray) < BLUR_THRESHOLD:
         return
-    
-    print(f"[{camera_name}] Camera {camera_id} opened successfully")
-    
-    infer_timer = time.time()
-    
-    while not stop_event.is_set():
-        ret, frame = cap.read()
-        if not ret:
-            continue
-        
-        # Frame skipping for performance
-        if camera_name == "CAM0":
-            frame_counter_cam0 += 1
-            if frame_counter_cam0 % FRAME_SKIP != 0:
-                continue
+    try:
+        if MODEL_MODE == "online" and client:
+            _, buffer = cv2.imencode('.jpg', processed)
+            result = client.run_workflow(
+                workspace_name=RF_WORKSPACE,
+                workflow_id=RF_WORKFLOW_ID,
+                images={"image": buffer.tobytes()}
+            )
+            preds = extract_predictions(result)
+            # Normalise field name: Roboflow uses 'class', code uses 'class_name'
+            for p in preds:
+                if 'class' in p and 'class_name' not in p:
+                    p['class_name'] = p['class']
+        elif MODEL_MODE == "offline" and local_model:
+            results = local_model(processed, conf=CONF_THRESH, device=YOLO_DEVICE, verbose=False)
+            preds = extract_predictions(results[0]) if len(results) > 0 else []
         else:
-            frame_counter_cam1 += 1
-            if frame_counter_cam1 % FRAME_SKIP != 0:
+            preds = []
+        global cam0_boxes, cam0_boxes_expire
+        new_boxes = []
+        for pred in preds:
+            conf = pred['confidence']
+            class_name = pred['class_name']
+            if ONLY_CLASS and class_name != ONLY_CLASS:
                 continue
-        
-        # Update global frame for streaming
-        with lock:
-            if global_frame_var == 'cam0':
-                cam0_frame = frame.copy()
-            else:
-                cam1_frame = frame.copy()
-        
-        # Inference throttle
-        if time.time() - infer_timer < (1.0 / INFER_FPS):
-            continue
-        infer_timer = time.time()
-        
-        # Preprocessing
-        processed = preprocess_frame(frame)
-        
-        # Blur check
-        gray = cv2.cvtColor(processed, cv2.COLOR_BGR2GRAY)
-        blur_score = compute_laplacian_variance(gray)
-        if blur_score < BLUR_THRESHOLD:
-            continue
-        
-        # Model inference
+            if conf < CONF_THRESH:
+                continue
+            x, y, w, h = pred['x'], pred['y'], pred['width'], pred['height']
+            if w * h < MIN_CRACK_AREA:
+                continue
+            # Store box for live overlay (centre-based → corner coords)
+            x1 = int(x - w / 2)
+            y1 = int(y - h / 2)
+            x2 = int(x + w / 2)
+            y2 = int(y + h / 2)
+            new_boxes.append((x1, y1, x2, y2, conf))
+            log_detection(camera_name, conf, class_name, x, y, w, h, frame)
+        if new_boxes:
+            with cam0_boxes_lock:
+                cam0_boxes = new_boxes
+                cam0_boxes_expire = time.time() + 1.5  # show box for 1.5 s
+    except Exception as e:
+        print(f"[{camera_name}] Inference error: {e}")
+
+
+def _ensure_camera_available():
+    """
+    Pre-flight: kill any stale Python processes holding the CSI camera, and
+    if WirePlumber is holding libcamera, restart it so it picks up our
+    config override that disables libcamera monitoring.
+    """
+    import signal as _signal
+    my_pid = os.getpid()
+    camera_devs = ['/dev/video0', '/dev/video1', '/dev/media4']
+
+    # Step 1: kill stale Python processes that have the camera open
+    for dev in camera_devs:
         try:
-            if MODEL_MODE == "online" and client:
-                # Online inference (Roboflow)
-                _, buffer = cv2.imencode('.jpg', processed)
-                result = client.run_workflow(
-                    workspace_name=RF_WORKSPACE,
-                    workflow_id=RF_WORKFLOW_ID,
-                    images={"image": buffer.tobytes()}
+            result = subprocess.run(['fuser', dev], capture_output=True, text=True, timeout=3)
+            for pid_str in result.stdout.split():
+                try:
+                    pid = int(pid_str)
+                    if pid == my_pid:
+                        continue
+                    proc = subprocess.run(
+                        ['ps', '-p', str(pid), '-o', 'comm='],
+                        capture_output=True, text=True, timeout=3
+                    )
+                    if 'python' in proc.stdout.lower():
+                        print(f"[CAMERA] Killing stale Python process {pid} holding {dev}", flush=True)
+                        os.kill(pid, _signal.SIGTERM)
+                        time.sleep(0.5)
+                except (ValueError, OSError):
+                    pass
+        except Exception:
+            pass
+
+    # Step 2: if WirePlumber still holds the camera, restart it so our
+    # ~/.config/wireplumber/wireplumber.conf.d/51-disable-libcamera.conf takes effect
+    time.sleep(0.3)
+    wireplumber_restarted = False
+    for dev in camera_devs:
+        if wireplumber_restarted:
+            break
+        try:
+            result = subprocess.run(['fuser', dev], capture_output=True, text=True, timeout=3)
+            for pid_str in result.stdout.split():
+                try:
+                    pid = int(pid_str)
+                    if pid == my_pid:
+                        continue
+                    proc = subprocess.run(
+                        ['ps', '-p', str(pid), '-o', 'comm='],
+                        capture_output=True, text=True, timeout=3
+                    )
+                    if 'wireplumber' in proc.stdout.lower():
+                        print("[CAMERA] WirePlumber is holding the camera — restarting it "
+                              "to apply libcamera-disable config...", flush=True)
+                        subprocess.run(
+                            ['systemctl', '--user', 'restart', 'wireplumber'],
+                            timeout=15
+                        )
+                        time.sleep(2)
+                        print("[CAMERA] WirePlumber restarted. Camera should now be free.", flush=True)
+                        wireplumber_restarted = True
+                        break
+                except (ValueError, OSError):
+                    pass
+        except Exception:
+            pass
+
+
+def cam_loop(camera_id: int, camera_name: str):
+    """
+    Camera capture loop — always captures frames for live feed.
+    Uses picamera2 for Pi CSI cameras, falls back to cv2.VideoCapture.
+    Inference only runs when the inspection project is active and not paused.
+    """
+    global cam0_frame, frame_counter_cam0
+
+    picam = None
+    use_picamera2 = False
+
+    if PICAMERA2_AVAILABLE:
+        # Release any competing processes (stale Python runs, WirePlumber) before
+        # attempting to claim the camera through libcamera.
+        _ensure_camera_available()
+        # ---- picamera2 path (Pi Camera Module 3 / CSI) ----
+        print(f"[{camera_name}] Opening via picamera2 (libcamera)", flush=True)
+        for attempt in range(5):
+            try:
+                if picam is not None:
+                    try:
+                        picam.close()
+                    except Exception:
+                        pass
+                    picam = None
+                if attempt > 0:
+                    print(f"[{camera_name}] Retry {attempt}/4 after 2s...", flush=True)
+                    time.sleep(2)
+                picam = Picamera2(camera_id)
+                cfg = picam.create_preview_configuration(
+                    main={"format": "RGB888", "size": (CAMERA_WIDTH, CAMERA_HEIGHT)}
                 )
-                preds = extract_predictions(result)
-            
-            elif MODEL_MODE == "offline" and local_model:
-                # Offline inference (YOLO)
-                results = local_model(processed, conf=CONF_THRESH, device=YOLO_DEVICE, verbose=False)
-                if len(results) > 0:
-                    preds = extract_predictions(results[0])
-                else:
-                    preds = []
-            else:
-                preds = []
-            
-            # Process detections
-            for pred in preds:
-                conf = pred['confidence']
-                class_name = pred['class_name']
-                
-                if ONLY_CLASS and class_name != ONLY_CLASS:
+                picam.configure(cfg)
+                picam.start()
+                use_picamera2 = True
+                print(f"[{camera_name}] picamera2 started successfully", flush=True)
+                break
+            except Exception as e:
+                print(f"[{camera_name}] picamera2 attempt {attempt+1} failed: {e}", flush=True)
+                if picam is not None:
+                    try:
+                        picam.close()
+                    except Exception:
+                        pass
+                    picam = None
+        if not use_picamera2:
+            print(f"[{camera_name}] picamera2 could not start after 5 attempts; falling back to cv2.VideoCapture.", flush=True)
+
+    if use_picamera2 and picam is not None:
+        infer_timer = time.time()
+        try:
+            while not cam_stop_event.is_set():
+                try:
+                    rgb = picam.capture_array()
+                except Exception as e:
+                    print(f"[{camera_name}] Capture error: {e}")
+                    time.sleep(0.1)
                     continue
-                if conf < CONF_THRESH:
+
+                # picamera2 gives RGB — convert to BGR for OpenCV
+                frame = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+
+                with cam0_lock:
+                    cam0_frame = frame.copy()
+
+                # Only run inference when project is active and not paused
+                with config_lock:
+                    _started = project_config.get("started", False)
+                if not _started or inspection_paused.is_set():
                     continue
-                
-                x, y = pred['x'], pred['y']
-                w, h = pred['width'], pred['height']
-                
-                # Area filter
-                area = w * h
-                if area < MIN_CRACK_AREA:
-                    continue
-                
-                # Log detection
-                log_detection(camera_name, conf, class_name, x, y, w, h, frame)
-        
-        except Exception as e:
-            print(f"[{camera_name}] Inference error: {e}")
-            continue
-    
-    cap.release()
-    print(f"[{camera_name}] Camera {camera_id} released")
+
+                if time.time() - infer_timer >= (1.0 / INFER_FPS):
+                    infer_timer = time.time()
+                    _run_inference_and_log(frame, camera_name)
+        finally:
+            picam.stop()
+            print(f"[{camera_name}] picamera2 stopped")
+        return
+
+    # ---- cv2.VideoCapture fallback (USB webcam / no CSI camera) ----
+    cap = None
+    for cv2_attempt in range(5):
+        if cv2_attempt > 0:
+            print(f"[{camera_name}] cv2 retry {cv2_attempt}/4 after 2s...", flush=True)
+            time.sleep(2)
+        cap = cv2.VideoCapture(camera_id)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
+        cap.set(cv2.CAP_PROP_FPS, CAPTURE_FPS)
+        if cap.isOpened():
+            break
+        cap.release()
+        cap = None
+    if cap is None or not cap.isOpened():
+        print(f"[{camera_name}] Failed to open camera {camera_id} after 5 attempts", flush=True)
+        return
+    print(f"[{camera_name}] cv2.VideoCapture opened camera {camera_id}", flush=True)
+    infer_timer = time.time()
+    try:
+        while not cam_stop_event.is_set():
+            ret, frame = cap.read()
+            if not ret:
+                time.sleep(0.01)
+                continue
+            with cam0_lock:
+                cam0_frame = frame.copy()
+
+            # Only run inference when project is active and not paused
+            with config_lock:
+                _started = project_config.get("started", False)
+            if not _started or inspection_paused.is_set():
+                continue
+
+            if time.time() - infer_timer >= (1.0 / INFER_FPS):
+                infer_timer = time.time()
+                _run_inference_and_log(frame, camera_name)
+    finally:
+        cap.release()
+        print(f"[{camera_name}] Camera {camera_id} released")
 
 
-# ---------------- FLASK APP ----------------
+# ---------------- FLASK WEB SERVER ----------------
 app = Flask(__name__)
 
-def generate_frames(camera_index: int):
-    """Generate frames for MJPEG streaming"""
-    while True:
-        if camera_index == 0:
-            with cam0_lock:
-                frame = cam0_frame
-        else:
-            with cam1_lock:
-                frame = cam1_frame
-        
-        if frame is None:
-            time.sleep(0.1)
-            continue
-        
-        # Add detection overlay
-        display_frame = frame.copy()
-        
-        # Add detection indicator
-        if camera_index == 0 and detection_flags["cam0"]:
-            cv2.putText(display_frame, "CRACK DETECTED", (10, 30),
-                       cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
-        elif camera_index == 1 and detection_flags["cam1"]:
-            cv2.putText(display_frame, "CRACK DETECTED", (10, 30),
-                       cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
-        
-        # Encode frame
-        ret, buffer = cv2.imencode('.jpg', display_frame)
-        if not ret:
-            continue
-        
-        frame_bytes = buffer.tobytes()
-        yield (b'--frame\r\n'
-               b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
-        
-        time.sleep(0.033)  # ~30 FPS
+# Project configuration state — set via web UI
+project_config = {
+    "initialized": False,
+    "pipeline_length": PIPELINE_LENGTH_METERS,
+    "robot_velocity": ROBOT_VELOCITY_MPS,
+    "inspection_duration": ESTIMATED_INSPECTION_DURATION_SEC,
+    "model_id": MODEL_MODE,
+    "started": False,
+    "paused": False,
+}
+config_lock = threading.Lock()
 
-
-@app.route('/')
-def index():
-    """Main dashboard page"""
-    model_display = "On-Device YOLOv11n (68% mAP)" if MODEL_MODE == "offline" else "Cloud-Based Roboflow API"
-    hardware_display = "Raspberry Pi 4 (Optimized)" if IS_PI4 else "Raspberry Pi 5"
-    
-    # Single or dual camera display
-    if CAMERA_MODE == "single":
-        video_section = '''
-        <div class="video-container-single">
-            <div class="video-wrapper">
-                <h3>Camera Feed</h3>
-                <img src="/video_feed/0" alt="Camera 0">
-            </div>
-        </div>
-        '''
-    else:
-        video_section = '''
-        <div class="video-container">
-            <div class="video-wrapper">
-                <h3>Camera 0</h3>
-                <img src="/video_feed/0" alt="Camera 0">
-            </div>
-            <div class="video-wrapper">
-                <h3>Camera 1</h3>
-                <img src="/video_feed/1" alt="Camera 1">
-            </div>
-        </div>
-        '''
-    
-    html = f'''
+CONFIG_TEMPLATE = """
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Automated Pipeline Inspection System</title>
+    <title>Project Configuration - Pipeline Crack Detection</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <style>
-        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-        body {{ 
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: #333;
-        }}
-        .header {{
-            background: white;
-            padding: 20px;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }}
-        .header h1 {{ 
-            color: #667eea;
-            font-size: 28px;
-        }}
-        .model-badge {{
-            padding: 8px 16px;
-            border-radius: 20px;
-            font-size: 14px;
-            font-weight: bold;
-        }}
-        .model-badge.offline {{
-            background: #4caf50;
-            color: white;
-        }}
-        .model-badge.online {{
-            background: #2196f3;
-            color: white;
-        }}
-        .hardware-badge {{
-            padding: 8px 16px;
-            border-radius: 20px;
-            font-size: 14px;
-            font-weight: bold;
-            background: #ff9800;
-            color: white;
-            margin-left: 10px;
-        }}
-        .stats-bar {{
-            background: white;
-            padding: 20px;
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-            gap: 15px;
-            margin: 10px;
-            border-radius: 10px;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-        }}
-        .stat-item {{
-            text-align: center;
-            padding: 15px;
-            background: #f5f5f5;
-            border-radius: 8px;
-        }}
-        .stat-label {{
-            font-size: 12px;
-            color: #666;
-            margin-bottom: 5px;
-        }}
-        .stat-value {{
-            font-size: 24px;
-            font-weight: bold;
-            color: #667eea;
-        }}
-        .video-container {{
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 20px;
-            padding: 20px;
-        }}
-        .video-container-single {{
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            color: #fff;
             display: flex;
             justify-content: center;
+            align-items: center;
+            min-height: 100vh;
             padding: 20px;
-        }}
-        .video-wrapper {{
-            background: white;
-            padding: 15px;
-            border-radius: 10px;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-        }}
-        .video-wrapper h3 {{
-            margin-bottom: 10px;
-            color: #667eea;
-        }}
-        .video-wrapper img {{
+        }
+        .config-container {
+            background: rgba(255,255,255,0.05);
+            border-radius: 20px;
+            padding: 40px;
+            max-width: 600px;
             width: 100%;
-            border-radius: 8px;
-        }}
-        .crack-list {{
-            background: white;
-            margin: 10px;
-            padding: 20px;
-            border-radius: 10px;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-            max-height: 400px;
-            overflow-y: auto;
-        }}
-        .crack-item {{
-            padding: 10px;
-            margin: 5px 0;
-            background: #f5f5f5;
-            border-radius: 5px;
-            border-left: 4px solid #667eea;
-        }}
-        .crack-item.critical {{ border-left-color: #f44336; }}
-        .crack-item.high {{ border-left-color: #ff9800; }}
-        .crack-item.medium {{ border-left-color: #ffc107; }}
-        .crack-item.low {{ border-left-color: #4caf50; }}
-        .report-button {{
-            display: block;
-            margin: 20px auto;
-            padding: 15px 30px;
-            background: #667eea;
-            color: white;
-            border: none;
-            border-radius: 25px;
-            font-size: 16px;
-            font-weight: bold;
-            cursor: pointer;
-            box-shadow: 0 4px 15px rgba(102, 126, 234, 0.4);
+            backdrop-filter: blur(10px);
+            border: 2px solid rgba(0,255,136,0.3);
+            box-shadow: 0 10px 50px rgba(0,0,0,0.5);
+        }
+        h1 { color: #00ff88; font-size: 2.2em; text-align: center; margin-bottom: 10px;
+             text-shadow: 0 0 20px rgba(0,255,136,0.5); }
+        .subtitle { text-align: center; opacity: 0.7; margin-bottom: 30px; }
+        .form-group { margin-bottom: 25px; }
+        label { display: block; margin-bottom: 8px; color: #00ff88; font-weight: 600; }
+        .help-text { font-size: 0.85em; opacity: 0.7; margin-top: 5px; }
+        input[type="number"], select {
+            width: 100%; padding: 12px; border-radius: 8px;
+            border: 2px solid rgba(255,255,255,0.2);
+            background: rgba(255,255,255,0.05); color: #fff; font-size: 1em;
             transition: all 0.3s;
-        }}
-        .report-button:hover {{
-            background: #764ba2;
-            transform: translateY(-2px);
-            box-shadow: 0 6px 20px rgba(118, 75, 162, 0.4);
-        }}
+        }
+        input[type="number"]:focus, select:focus {
+            outline: none; border-color: #00ff88;
+            background: rgba(0,255,136,0.05);
+        }
+        select option { background: #1a1a2e; }
+        .btn {
+            width: 100%; padding: 15px; border-radius: 8px; border: none;
+            background: linear-gradient(135deg, #00ff88 0%, #00cc6a 100%);
+            color: #000; font-size: 1.2em; font-weight: bold;
+            cursor: pointer; transition: all 0.3s; margin-top: 20px;
+        }
+        .btn:hover { transform: translateY(-2px);
+                     box-shadow: 0 5px 20px rgba(0,255,136,0.4); }
+        .info-box {
+            background: rgba(0,136,255,0.1); border-left: 4px solid #0088ff;
+            padding: 15px; border-radius: 8px; margin-bottom: 25px;
+        }
+        .info-box h3 { color: #0088ff; margin-bottom: 8px; }
+        .duration-box {
+            background: rgba(0,255,136,0.1); padding: 15px;
+            border-radius: 8px; margin: 20px 0;
+        }
+        .error { background: rgba(255,0,0,0.1); border: 1px solid #f00;
+                 padding: 10px; border-radius: 5px; margin-top: 10px; display: none; }
+    </style>
+</head>
+<body>
+    <div class="config-container">
+        <h1>🔧 Project Setup</h1>
+        <p class="subtitle">Raspberry Pi 4 — Single Camera Inspection</p>
+
+        <div class="info-box">
+            <h3>ℹ️ Before You Start</h3>
+            <p>Configure pipeline parameters for accurate crack position tracking. Settings take effect immediately on start.</p>
+        </div>
+
+        <form id="configForm">
+            <div class="form-group">
+                <label for="pipelineLength">Pipeline Length (meters)</label>
+                <input type="number" id="pipelineLength" value="100" min="1" max="10000" step="0.1" required>
+                <p class="help-text">Total length of the pipeline to inspect</p>
+            </div>
+
+            <div class="form-group">
+                <label for="robotVelocity">Robot Velocity</label>
+                <div style="display:flex;gap:10px;">
+                    <input type="number" id="robotVelocity" value="0.6" min="0.001" max="100" step="0.001" required style="flex:1;">
+                    <select id="velocityUnit" style="width:100px;">
+                        <option value="kmh" selected>km/h</option>
+                        <option value="ms">m/s</option>
+                    </select>
+                </div>
+                <p class="help-text">Speed of the robot (Default: 0.6 km/h = 0.167 m/s)</p>
+            </div>
+
+            <div class="form-group">
+                <label for="modelSelect">Detection Model</label>
+                <select id="modelSelect" required>
+                    <option value="offline" selected>pipe_crack_ai — On-Device (68% mAP)</option>
+                    <option value="online">Roboflow Cloud</option>
+                </select>
+                <p class="help-text">Select the detection model</p>
+            </div>
+
+            <div class="duration-box">
+                <strong>Estimated Inspection Duration:</strong>
+                <span id="durationValue">600</span> s
+                (<span id="durationMinutes">10.0</span> min)
+            </div>
+
+            <button type="submit" class="btn">🚀 Start Inspection System</button>
+            <div class="error" id="errorMsg"></div>
+        </form>
+    </div>
+
+    <script>
+        function getVelocityMS() {
+            const v = parseFloat(document.getElementById('robotVelocity').value) || 0.6;
+            const u = document.getElementById('velocityUnit').value;
+            return u === 'kmh' ? v / 3.6 : v;
+        }
+        function updateDuration() {
+            const len = parseFloat(document.getElementById('pipelineLength').value) || 100;
+            const vms = getVelocityMS();
+            const dur = vms > 0 ? (len / vms) : 600;
+            document.getElementById('durationValue').textContent = dur.toFixed(0);
+            document.getElementById('durationMinutes').textContent = (dur / 60).toFixed(1);
+        }
+        document.getElementById('pipelineLength').addEventListener('input', updateDuration);
+        document.getElementById('robotVelocity').addEventListener('input', updateDuration);
+        document.getElementById('velocityUnit').addEventListener('change', updateDuration);
+        updateDuration();
+
+        document.getElementById('configForm').addEventListener('submit', async function(e) {
+            e.preventDefault();
+            const len = parseFloat(document.getElementById('pipelineLength').value);
+            const vms = getVelocityMS();
+            const dur = vms > 0 ? (len / vms) : 600;
+            const config = {
+                pipeline_length: len,
+                robot_velocity: vms,
+                inspection_duration: dur,
+                model_id: document.getElementById('modelSelect').value,
+            };
+            try {
+                const r1 = await fetch('/api/config', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(config)
+                });
+                if (!r1.ok) throw new Error('Configuration failed');
+                const r2 = await fetch('/api/start_project', { method: 'POST' });
+                if (!r2.ok) {
+                    const d = await r2.json();
+                    throw new Error(d.error || 'Failed to start project');
+                }
+                window.location.href = '/';
+            } catch (err) {
+                document.getElementById('errorMsg').textContent = 'Error: ' + err.message;
+                document.getElementById('errorMsg').style.display = 'block';
+            }
+        });
+    </script>
+</body>
+</html>
+"""
+
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Pipeline Crack Detection — Pi 4</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            color: #fff; padding: 20px; min-height: 100vh;
+        }
+        .header { text-align: center; margin-bottom: 30px; }
+        h1 { color: #00ff88; font-size: 2.2em;
+             text-shadow: 0 0 20px rgba(0,255,136,0.5); margin-bottom: 10px; }
+        .stats-bar {
+            display: flex; justify-content: center; gap: 20px;
+            margin: 20px 0; flex-wrap: wrap;
+        }
+        .stat-item {
+            background: rgba(255,255,255,0.1); padding: 10px 20px;
+            border-radius: 8px; backdrop-filter: blur(10px); text-align: center;
+        }
+        .stat-label { font-size: 0.9em; opacity: 0.7; }
+        .stat-value { font-size: 1.5em; font-weight: bold; color: #00ff88; }
+
+        /* Pipeline */
+        .pipeline-section {
+            background: rgba(255,255,255,0.05); border-radius: 15px;
+            padding: 25px; margin: 20px 0; backdrop-filter: blur(10px);
+            border: 1px solid rgba(255,255,255,0.1);
+        }
+        .pipeline-title { font-size: 1.4em; margin-bottom: 20px; color: #00ff88; }
+        .pipeline-container {
+            position: relative; width: 100%; height: 100px;
+            background: linear-gradient(to right, #2a2a2a 0%, #3a3a3a 50%, #2a2a2a 100%);
+            border-radius: 50px; overflow: visible;
+            border: 3px solid #555; box-shadow: inset 0 4px 10px rgba(0,0,0,0.5);
+        }
+        .pipeline-markers {
+            position: absolute; bottom: -28px; width: 100%;
+            display: flex; justify-content: space-between;
+            padding: 0 10px; font-size: 0.78em; color: #888;
+        }
+        .crack-marker {
+            position: absolute; width: 18px; height: 18px; border-radius: 50%;
+            cursor: pointer; top: 50%; transform: translate(-50%,-50%);
+            transition: all 0.3s; z-index: 10; animation: pulse 2s infinite;
+        }
+        .crack-marker.CRITICAL { background:#ff0000; box-shadow:0 0 15px #ff0000,0 0 30px #ff000080; }
+        .crack-marker.HIGH     { background:#ff6600; box-shadow:0 0 15px #ff6600,0 0 30px #ff660080; }
+        .crack-marker.MEDIUM   { background:#ffff00; box-shadow:0 0 15px #ffff00,0 0 30px #ffff0080; }
+        .crack-marker.LOW      { background:#00ff00; box-shadow:0 0 15px #00ff00,0 0 30px #00ff0080; }
+        .crack-marker:hover { transform:translate(-50%,-50%) scale(1.5); z-index:100; }
+        @keyframes pulse {
+            0%,100% { transform:translate(-50%,-50%) scale(1); }
+            50%      { transform:translate(-50%,-50%) scale(1.2); }
+        }
+        .legend {
+            display:flex; justify-content:center; gap:20px;
+            margin-top:20px; flex-wrap:wrap;
+        }
+        .legend-item { display:flex; align-items:center; gap:8px; font-size:0.9em; }
+        .legend-color { width:14px; height:14px; border-radius:50%; }
+
+        /* Modal */
+        .modal {
+            display:none; position:fixed; z-index:1000;
+            left:0; top:0; width:100%; height:100%;
+            background:rgba(0,0,0,0.8); backdrop-filter:blur(5px);
+        }
+        .modal-content {
+            background:linear-gradient(135deg,#2a2a3e 0%,#1e2742 100%);
+            margin:5% auto; border-radius:15px; width:90%; max-width:800px;
+            box-shadow:0 10px 50px rgba(0,255,136,0.3);
+            border:2px solid rgba(0,255,136,0.3); max-height:90vh; overflow-y:auto;
+        }
+        .modal-header {
+            padding:20px; border-bottom:1px solid rgba(255,255,255,0.1);
+            display:flex; justify-content:space-between; align-items:center;
+        }
+        .modal-body { padding:20px; }
+        .close { color:#aaa; font-size:35px; font-weight:bold;
+                 cursor:pointer; transition:color 0.3s; }
+        .close:hover { color:#00ff88; }
+        .crack-image { width:100%; border-radius:10px; margin-bottom:20px;
+                       border:2px solid rgba(255,255,255,0.2); }
+        .detail-grid {
+            display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr));
+            gap:15px; margin-top:20px;
+        }
+        .detail-item {
+            background:rgba(255,255,255,0.05); padding:15px;
+            border-radius:8px; border-left:4px solid #00ff88;
+        }
+        .detail-label { font-size:0.9em; opacity:0.7; margin-bottom:5px; }
+        .detail-value { font-size:1.2em; font-weight:bold; }
+        .severity-badge {
+            display:inline-block; padding:5px 15px; border-radius:20px;
+            font-weight:bold; text-transform:uppercase;
+        }
+        .severity-CRITICAL { background:#ff0000; color:#fff; }
+        .severity-HIGH     { background:#ff6600; color:#fff; }
+        .severity-MEDIUM   { background:#ffff00; color:#000; }
+        .severity-LOW      { background:#00ff00; color:#000; }
+
+        /* Camera */
+        .camera-box {
+            background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1);
+            border-radius:15px; padding:20px; backdrop-filter:blur(10px);
+        }
+        .camera-box h2 { color:#00ff88; margin-bottom:15px; }
+        .camera-box img { width:100%; border-radius:10px;
+                          border:2px solid rgba(255,255,255,0.2); }
+        .cam-stats {
+            margin-top:15px; display:grid;
+            grid-template-columns:repeat(2,1fr); gap:10px;
+        }
+        .cam-stat { background:rgba(0,0,0,0.3); padding:10px; border-radius:5px; }
+        .cam-stat-label { font-size:0.85em; opacity:0.7; }
+        .cam-stat-value { font-weight:bold; color:#00ff88; }
+
+        /* Buttons */
+        .control-btn {
+            padding:12px 25px; border-radius:8px; border:none;
+            background:linear-gradient(135deg,#00ff88 0%,#00cc6a 100%);
+            color:#000; font-size:1.1em; font-weight:bold;
+            cursor:pointer; transition:all 0.3s;
+        }
+        .control-btn:hover { transform:translateY(-2px);
+                             box-shadow:0 5px 20px rgba(0,255,136,0.4); }
     </style>
 </head>
 <body>
     <div class="header">
-        <h1>
-            Automated Pipeline Inspection System
-            <span class="model-badge {MODEL_MODE}">{model_display}</span>
-            <span class="hardware-badge">{hardware_display}</span>
-        </h1>
+        <h1>🔍 Pipeline Crack Detection System</h1>
+        <p style="opacity:0.7;">Raspberry Pi 4 — Single Camera</p>
     </div>
-    
+
     <div class="stats-bar">
         <div class="stat-item">
             <div class="stat-label">Pipeline Length</div>
-            <div class="stat-value" id="pipeline-length">{PIPELINE_LENGTH_METERS:.1f}m</div>
+            <div class="stat-value" id="pipeline-length">-</div>
+        </div>
+        <div class="stat-item">
+            <div class="stat-label">Robot Velocity</div>
+            <div class="stat-value" id="robot-velocity">-</div>
+        </div>
+        <div class="stat-item">
+            <div class="stat-label">Model</div>
+            <div class="stat-value" id="model-name" style="font-size:0.8em;">-</div>
         </div>
         <div class="stat-item">
             <div class="stat-label">Current Position</div>
-            <div class="stat-value" id="current-position">0.0m</div>
-        </div>
-        <div class="stat-item">
-            <div class="stat-label">Progress</div>
-            <div class="stat-value" id="progress">0%</div>
+            <div class="stat-value" id="current-position">-</div>
         </div>
         <div class="stat-item">
             <div class="stat-label">Total Cracks</div>
@@ -1121,181 +1382,497 @@ def index():
         </div>
         <div class="stat-item">
             <div class="stat-label">Critical</div>
-            <div class="stat-value" id="critical-cracks" style="color: #f44336;">0</div>
-        </div>
-        <div class="stat-item">
-            <div class="stat-label">High</div>
-            <div class="stat-value" id="high-cracks" style="color: #ff9800;">0</div>
+            <div class="stat-value" style="color:#ff0000;" id="critical-count">0</div>
         </div>
     </div>
-    
-    {video_section}
-    
-    <button class="report-button" onclick="generateReport()">Generate PDF Report</button>
-    
-    <div class="crack-list">
-        <h2>Recent Detections</h2>
-        <div id="crack-items"></div>
+
+    <!-- Pipeline visualization -->
+    <div class="pipeline-section">
+        <div class="pipeline-title">Pipeline Visualization</div>
+        <div class="pipeline-container" id="pipeline-container">
+            <div class="pipeline-markers">
+                <span>0m</span>
+                <span id="pipeline-end">100m</span>
+            </div>
+        </div>
+        <div class="legend">
+            <div class="legend-item"><div class="legend-color" style="background:#ff0000;"></div><span>Critical</span></div>
+            <div class="legend-item"><div class="legend-color" style="background:#ff6600;"></div><span>High</span></div>
+            <div class="legend-item"><div class="legend-color" style="background:#ffff00;"></div><span>Medium</span></div>
+            <div class="legend-item"><div class="legend-color" style="background:#00ff00;"></div><span>Low</span></div>
+        </div>
     </div>
-    
+
+    <!-- Control Panel -->
+    <div class="pipeline-section">
+        <div class="pipeline-title">🎮 Control Panel</div>
+        <div style="display:flex;gap:15px;flex-wrap:wrap;justify-content:center;margin-top:20px;">
+            <button class="control-btn" id="pauseBtn" onclick="togglePause()">⏸ Pause</button>
+            <button class="control-btn" onclick="stopProject()"
+                    style="background:linear-gradient(135deg,#ff4444 0%,#cc0000 100%);">⏹ Stop Project</button>
+            <button class="control-btn" onclick="exportPDF()"
+                    style="background:linear-gradient(135deg,#4488ff 0%,#0044aa 100%);">📄 Export PDF</button>
+            <button class="control-btn" onclick="window.location.reload()">🔄 Refresh</button>
+        </div>
+        <div id="controlStatus" style="text-align:center;margin-top:15px;font-size:1.1em;color:#00ff88;"></div>
+    </div>
+
+    <!-- Camera feed -->
+    <div class="pipeline-section">
+        <div class="camera-box">
+            <h2>📹 Camera 0</h2>
+            <img src="/video_feed" alt="Camera 0">
+            <div class="cam-stats">
+                <div class="cam-stat">
+                    <div class="cam-stat-label">Status</div>
+                    <div class="cam-stat-value" id="cam0-status">IDLE</div>
+                </div>
+                <div class="cam-stat">
+                    <div class="cam-stat-label">Detecting</div>
+                    <div class="cam-stat-value" id="cam0-detections">—</div>
+                </div>
+                <div class="cam-stat">
+                    <div class="cam-stat-label">Total Cracks</div>
+                    <div class="cam-stat-value" id="cam0-total" style="color:#ff4444;">0</div>
+                </div>
+                <div class="cam-stat">
+                    <div class="cam-stat-label">Progress</div>
+                    <div class="cam-stat-value" id="cam0-progress">0%</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Crack detail modal -->
+    <div id="crackModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2 id="modal-title">Crack Details</h2>
+                <span class="close">&times;</span>
+            </div>
+            <div class="modal-body">
+                <img id="modal-image" class="crack-image" src="" alt="Crack Image">
+                <div class="detail-grid">
+                    <div class="detail-item"><div class="detail-label">Crack ID</div>
+                        <div class="detail-value" id="modal-crack-id">-</div></div>
+                    <div class="detail-item"><div class="detail-label">Position</div>
+                        <div class="detail-value" id="modal-position">-</div></div>
+                    <div class="detail-item"><div class="detail-label">Confidence</div>
+                        <div class="detail-value" id="modal-confidence">-</div></div>
+                    <div class="detail-item"><div class="detail-label">Severity</div>
+                        <div class="detail-value" id="modal-severity">-</div></div>
+                    <div class="detail-item"><div class="detail-label">Area (px²)</div>
+                        <div class="detail-value" id="modal-area">-</div></div>
+                    <div class="detail-item"><div class="detail-label">Time</div>
+                        <div class="detail-value" id="modal-time">-</div></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <script>
-        function updateStats() {{
+        const modal = document.getElementById('crackModal');
+        document.getElementsByClassName('close')[0].onclick = () => modal.style.display = 'none';
+        window.onclick = e => { if (e.target === modal) modal.style.display = 'none'; };
+        const pipelineContainer = document.getElementById('pipeline-container');
+
+        function showCrackDetail(crack) {
+            document.getElementById('modal-title').textContent = `Crack #${crack.crack_id} Details`;
+            document.getElementById('modal-image').src = `/crack_image/${crack.crack_id}`;
+            document.getElementById('modal-crack-id').textContent = crack.crack_id;
+            document.getElementById('modal-position').textContent = crack.position_m.toFixed(2) + ' m';
+            document.getElementById('modal-confidence').textContent = (crack.confidence * 100).toFixed(1) + '%';
+            document.getElementById('modal-area').textContent = Math.round(crack.area_px) + ' px²';
+            document.getElementById('modal-time').textContent = crack.timestamp_str;
+            const sev = document.getElementById('modal-severity');
+            sev.innerHTML = `<span class="severity-badge severity-${crack.severity}">${crack.severity}</span>`;
+            modal.style.display = 'block';
+        }
+
+        function updatePipeline() {
             fetch('/api/cracks')
-                .then(response => response.json())
-                .then(data => {{
-                    // Calculate elapsed time
-                    const elapsed = (Date.now() / 1000) - {inspection_start_time};
-                    const position = {ROBOT_VELOCITY_MPS} * elapsed;
-                    const clampedPosition = Math.min(position, {PIPELINE_LENGTH_METERS});
-                    const progress = (clampedPosition / {PIPELINE_LENGTH_METERS} * 100).toFixed(1);
-                    
-                    document.getElementById('current-position').textContent = clampedPosition.toFixed(1) + 'm';
-                    document.getElementById('progress').textContent = progress + '%';
-                    document.getElementById('total-cracks').textContent = data.length;
-                    
-                    // Count by severity
-                    let critical = 0, high = 0;
-                    data.forEach(crack => {{
-                        if (crack.severity === 'Critical') critical++;
-                        else if (crack.severity === 'High') high++;
-                    }});
-                    
-                    document.getElementById('critical-cracks').textContent = critical;
-                    document.getElementById('high-cracks').textContent = high;
-                    
-                    // Update crack list (last 10)
-                    const crackItems = document.getElementById('crack-items');
-                    crackItems.innerHTML = '';
-                    data.slice(-10).reverse().forEach(crack => {{
-                        const div = document.createElement('div');
-                        div.className = 'crack-item ' + crack.severity.toLowerCase();
-                        div.innerHTML = `
-                            <strong>ID #${{crack.id}}</strong> - ${{crack.timestamp}} - 
-                            ${{crack.camera}} - Position: ${{crack.position_m}}m - 
-                            Confidence: ${{(crack.confidence * 100).toFixed(1)}}% - 
-                            <span style="color: ${{getSeverityColor(crack.severity)}}">${{crack.severity}}</span>
-                        `;
-                        crackItems.appendChild(div);
-                    }});
-                }});
-        }}
-        
-        function getSeverityColor(severity) {{
-            const colors = {{
-                'Critical': '#f44336',
-                'High': '#ff9800',
-                'Medium': '#ffc107',
-                'Low': '#4caf50'
-            }};
-            return colors[severity] || '#666';
-        }}
-        
-        function generateReport() {{
-            window.location.href = '/generate_report';
-        }}
-        
-        // Update every 2 seconds
-        updateStats();
-        setInterval(updateStats, 2000);
+                .then(r => r.json())
+                .then(data => {
+                    const plen = data.pipeline_length_m;
+                    const cracks = data.cracks;
+                    document.getElementById('pipeline-length').textContent = plen.toFixed(1) + 'm';
+                    document.getElementById('pipeline-end').textContent = plen.toFixed(0) + 'm';
+                    document.getElementById('current-position').textContent = data.current_position_m.toFixed(2) + 'm';
+                    document.getElementById('total-cracks').textContent = cracks.length;
+                    document.getElementById('cam0-total').textContent = cracks.length;
+
+                    const prog = plen > 0 ? (data.current_position_m / plen * 100).toFixed(1) : '0.0';
+                    document.getElementById('cam0-progress').textContent = prog + '%';
+
+                    if (data.robot_velocity !== undefined) {
+                        document.getElementById('robot-velocity').textContent =
+                            (data.robot_velocity * 3.6).toFixed(2) + ' km/h';
+                    }
+                    if (data.model_id) {
+                        document.getElementById('model-name').textContent =
+                            data.model_id === 'offline' ? 'pipe_crack_ai' : 'Roboflow';
+                    }
+
+                    const critical = cracks.filter(c => c.severity === 'CRITICAL').length;
+                    document.getElementById('critical-count').textContent = critical;
+
+                    // Rebuild pipeline markers
+                    pipelineContainer.querySelectorAll('.crack-marker').forEach(m => m.remove());
+                    cracks.forEach(crack => {
+                        const m = document.createElement('div');
+                        m.className = `crack-marker ${crack.severity}`;
+                        m.style.left = (crack.position_m / plen * 100) + '%';
+                        m.title = `Crack #${crack.crack_id} @ ${crack.position_m.toFixed(2)}m — ${crack.severity}`;
+                        m.onclick = () => showCrackDetail(crack);
+                        pipelineContainer.appendChild(m);
+                    });
+                })
+                .catch(e => console.error('Pipeline update error:', e));
+        }
+
+        function updateSystemStatus() {
+            fetch('/api/system_status')
+                .then(r => r.json())
+                .then(data => {
+                    if (data.cameras && data.cameras.camera0) {
+                        const c = data.cameras.camera0;
+                        document.getElementById('cam0-status').textContent =
+                            c.status ? c.status.toUpperCase() : 'SCANNING';
+                        document.getElementById('cam0-detections').textContent =
+                            c.crack_detected ? '⚠ YES' : 'None';
+                        document.getElementById('cam0-status').style.color =
+                            c.crack_detected ? '#ff4444' : '#00ff88';
+                    }
+                    if (data.paused) {
+                        document.getElementById('controlStatus').textContent = '⏸ PAUSED';
+                        document.getElementById('controlStatus').style.color = '#ffaa00';
+                        document.getElementById('pauseBtn').textContent = '▶ Resume';
+                    } else if (data.started) {
+                        document.getElementById('controlStatus').textContent = '▶ RUNNING';
+                        document.getElementById('controlStatus').style.color = '#00ff88';
+                        document.getElementById('pauseBtn').textContent = '⏸ Pause';
+                    }
+                })
+                .catch(e => console.error('Status update error:', e));
+        }
+
+        function togglePause() {
+            fetch('/api/pause_project', { method: 'POST' })
+                .then(r => r.json())
+                .then(d => {
+                    if (d.status === 'success') updateSystemStatus();
+                    else alert('Error: ' + (d.error || d.message));
+                })
+                .catch(e => alert('Error: ' + e));
+        }
+
+        function stopProject() {
+            if (!confirm('Stop the inspection? This ends the current session.')) return;
+            fetch('/api/stop_project', { method: 'POST' })
+                .then(r => r.json())
+                .then(d => {
+                    if (d.status === 'success') {
+                        alert('Project stopped. Returning to setup.');
+                        window.location.reload();
+                    } else {
+                        alert('Error: ' + (d.error || d.message));
+                    }
+                })
+                .catch(e => alert('Error: ' + e));
+        }
+
+        function exportPDF() {
+            const s = document.getElementById('controlStatus');
+            s.textContent = '📄 Generating PDF…';
+            s.style.color = '#4488ff';
+            window.location.href = '/api/export_pdf';
+            setTimeout(() => {
+                s.textContent = '✓ PDF downloaded';
+                s.style.color = '#00ff88';
+                setTimeout(() => { s.textContent = '▶ RUNNING'; }, 3000);
+            }, 2500);
+        }
+
+        updatePipeline();
+        updateSystemStatus();
+        setInterval(updatePipeline, 2000);
+        setInterval(updateSystemStatus, 1000);
     </script>
 </body>
 </html>
-    '''
-    return html
+"""
 
 
-@app.route('/video_feed/<int:camera>')
-def video_feed(camera):
-    """Video streaming route"""
-    return Response(generate_frames(camera),
-                   mimetype='multipart/x-mixed-replace; boundary=frame')
+def generate_frames():
+    """Generate MJPEG frames for web streaming."""
+    last_t = 0
+    while True:
+        # Throttle to ~20 FPS
+        now = time.time()
+        if now - last_t < 0.05:
+            time.sleep(0.01)
+            continue
+        last_t = now
+
+        with cam0_lock:
+            frame = cam0_frame
+
+        if frame is None:
+            placeholder = np.zeros((480, 640, 3), dtype=np.uint8)
+            # Show a friendlier message while camera is still initializing on startup
+            elapsed_since_start = time.time() - _app_start_time
+            msg = "Camera Initializing..." if elapsed_since_start < 15 else "Camera Not Active"
+            cv2.putText(placeholder, msg, (110, 240),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+            ret, buf = cv2.imencode('.jpg', placeholder)
+        else:
+            display = frame.copy()
+            # Draw bounding boxes around detected cracks
+            with cam0_boxes_lock:
+                boxes_now = cam0_boxes if time.time() < cam0_boxes_expire else []
+            for (x1, y1, x2, y2, conf) in boxes_now:
+                cv2.rectangle(display, (x1, y1), (x2, y2), (0, 0, 255), 2)
+                label = f"crack {conf:.0%}"
+                lx, ly = x1, max(y1 - 8, 12)
+                cv2.putText(display, label, (lx, ly),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2)
+            if detection_flags["cam0"]:
+                cv2.putText(display, "CRACK DETECTED", (10, 35),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
+            with config_lock:
+                _started = project_config.get("started", False)
+                _vel = project_config.get("robot_velocity", ROBOT_VELOCITY_MPS)
+                _plen = project_config.get("pipeline_length", PIPELINE_LENGTH_METERS)
+            if _started:
+                _elapsed = time.time() - inspection_start_time
+                _pos = min(_vel * _elapsed, _plen)
+                display = draw_location_indicator(display, _pos, _plen, time.strftime("%H:%M:%S"))
+            ret, buf = cv2.imencode('.jpg', display)
+
+        if not ret:
+            continue
+        yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + buf.tobytes() + b'\r\n')
+
+
+# --------------- FLASK ROUTES ----------------
+
+@app.route('/')
+def index():
+    with config_lock:
+        if not project_config["initialized"]:
+            return render_template_string(CONFIG_TEMPLATE)
+        return render_template_string(HTML_TEMPLATE)
+
+
+@app.route('/api/config', methods=['GET', 'POST'])
+def handle_config():
+    global project_config, PIPELINE_LENGTH_METERS, ROBOT_VELOCITY_MPS
+    global ESTIMATED_INSPECTION_DURATION_SEC, MODEL_MODE
+    if request.method == 'POST':
+        data = request.json
+        with config_lock:
+            project_config["pipeline_length"] = float(data.get('pipeline_length', 100.0))
+            project_config["robot_velocity"] = float(data.get('robot_velocity', 0.167))
+            project_config["inspection_duration"] = float(data.get('inspection_duration', 600.0))
+            project_config["model_id"] = data.get('model_id', 'offline')
+            project_config["initialized"] = True
+            PIPELINE_LENGTH_METERS = project_config["pipeline_length"]
+            ROBOT_VELOCITY_MPS = project_config["robot_velocity"]
+            ESTIMATED_INSPECTION_DURATION_SEC = project_config["inspection_duration"]
+            MODEL_MODE = project_config["model_id"]
+        return jsonify({"status": "success", "message": "Configuration saved"})
+    else:
+        with config_lock:
+            return jsonify(project_config)
+
+
+@app.route('/api/start_project', methods=['POST'])
+def start_project():
+    global project_config, inspection_start_time, crack_log, next_id, client, local_model
+    global MODEL_MODE, PIPELINE_LENGTH_METERS, ROBOT_VELOCITY_MPS
+    with config_lock:
+        if project_config["started"]:
+            return jsonify({"error": "Project already started"}), 400
+
+        # Reset state
+        stop_event.clear()
+        inspection_paused.clear()
+        inspection_start_time = time.time()
+        with crack_lock:
+            crack_log.clear()
+        next_id = 1
+        detection_flags["cam0"] = False
+
+        # Re-initialize model based on selection
+        MODEL_MODE = project_config["model_id"]
+        client = None
+        local_model = None
+        if MODEL_MODE == "online" and ROBOFLOW_AVAILABLE and RF_API_KEY:
+            try:
+                client = InferenceHTTPClient(
+                    api_url="https://serverless.roboflow.com",
+                    api_key=RF_API_KEY,
+                )
+                print("[WEB] Online model (Roboflow) initialized")
+            except Exception as _e:
+                print(f"[WEB] Failed to init online model: {_e}")
+        elif MODEL_MODE == "offline" and ULTRALYTICS_AVAILABLE and Path(LOCAL_MODEL_PATH).exists():
+            try:
+                local_model = YOLO(LOCAL_MODEL_PATH)
+                print("[WEB] Offline YOLO model initialized")
+            except Exception as _e:
+                print(f"[WEB] Failed to load offline model: {_e}")
+
+        # Camera thread is started at app startup — no need to restart it here
+
+        # Start flag updater
+        def _flag_updater():
+            while not stop_event.is_set():
+                update_flags()
+                time.sleep(0.1)
+        threading.Thread(target=_flag_updater, daemon=True).start()
+
+        project_config["started"] = True
+        project_config["paused"] = False
+    return jsonify({"status": "success", "message": "Project started"})
+
+
+@app.route('/api/pause_project', methods=['POST'])
+def pause_project():
+    with config_lock:
+        if not project_config["started"]:
+            return jsonify({"error": "Project not started"}), 400
+        project_config["paused"] = not project_config["paused"]
+        if project_config["paused"]:
+            inspection_paused.set()
+        else:
+            inspection_paused.clear()
+        status = "paused" if project_config["paused"] else "resumed"
+    return jsonify({"status": "success", "message": f"Project {status}"})
+
+
+@app.route('/api/stop_project', methods=['POST'])
+def stop_project():
+    global project_config
+    with config_lock:
+        stop_event.set()
+        inspection_paused.clear()
+        project_config["started"] = False
+        project_config["paused"] = False
+        project_config["initialized"] = False
+    return jsonify({"status": "success", "message": "Project stopped"})
+
+
+@app.route('/api/system_status')
+def system_status():
+    with config_lock:
+        cfg = dict(project_config)
+    with crack_lock:
+        total = len(crack_log)
+    status = {
+        "initialized": cfg["initialized"],
+        "started": cfg["started"],
+        "paused": cfg["paused"],
+        "pipeline_length": cfg["pipeline_length"],
+        "inspection_duration": cfg.get("inspection_duration", 0),
+        "cameras": {}
+    }
+    if cfg["started"]:
+        status["cameras"]["camera0"] = {
+            "active": True,
+            "status": "detecting" if detection_flags["cam0"] else "scanning",
+            "crack_detected": detection_flags["cam0"],
+            "confidence": 0.0,
+            "count": 1 if detection_flags["cam0"] else 0,
+            "total_cracks": total,
+            "stats": {}
+        }
+    return jsonify(status)
 
 
 @app.route('/api/cracks')
 def api_cracks():
-    """Return crack detection data as JSON"""
     with crack_lock:
-        data = crack_log.copy()
-    return jsonify(data)
-
-
-@app.route('/generate_report')
-def generate_report_route():
-    """Generate and download PDF report"""
-    try:
-        with crack_lock:
-            cracks_data = crack_log.copy()
-        
-        report_path = REPORTS_DIR / f"inspection_report_{stamp()}.pdf"
-        success = generate_pdf_report(cracks_data, report_path)
-        
-        if success and report_path.exists():
-            return send_file(
-                report_path,
-                as_attachment=True,
-                download_name=f"inspection_report_{stamp()}.pdf",
-                mimetype='application/pdf'
-            )
-        else:
-            return "Failed to generate report", 500
-    except Exception as e:
-        print(f"[ERROR] Report generation failed: {e}")
-        return f"Error: {e}", 500
+        data = list(crack_log)
+    cracks_out = []
+    for c in data:
+        cracks_out.append({
+            "crack_id": c["id"],
+            "camera_id": 0,
+            "position_m": c.get("position_m", 0.0),
+            "confidence": c["confidence"],
+            "severity": c["severity"].upper(),
+            "area_px": c.get("width", 0) * c.get("height", 0),
+            "timestamp_str": c["timestamp"],
+            "image_path": c.get("image_path", ""),
+        })
+    elapsed = time.time() - inspection_start_time
+    current_pos = min(ROBOT_VELOCITY_MPS * elapsed, PIPELINE_LENGTH_METERS)
+    with config_lock:
+        vel = project_config.get("robot_velocity", ROBOT_VELOCITY_MPS)
+        model_id = project_config.get("model_id", MODEL_MODE)
+    return jsonify({
+        "pipeline_length_m": PIPELINE_LENGTH_METERS,
+        "robot_velocity": vel,
+        "model_id": model_id,
+        "current_position_m": current_pos,
+        "total_cracks": len(cracks_out),
+        "cracks": cracks_out,
+    })
 
 
 @app.route('/crack_image/<int:crack_id>')
 def crack_image(crack_id):
-    """Serve crack image by ID"""
     with crack_lock:
         crack = next((c for c in crack_log if c['id'] == crack_id), None)
-    
-    if crack and 'image_path' in crack:
-        img_path = Path(crack['image_path'])
-        if img_path.exists():
-            return send_file(img_path, mimetype='image/jpeg')
-    
+    if crack and 'image_path' in crack and Path(crack['image_path']).exists():
+        return send_file(crack['image_path'], mimetype='image/jpeg')
     return "Image not found", 404
+
+
+@app.route('/video_feed')
+def video_feed():
+    return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+
+@app.route('/api/export_pdf', methods=['GET'])
+def export_pdf():
+    try:
+        with crack_lock:
+            cracks_data = list(crack_log)
+        report_path = REPORTS_DIR / f"inspection_report_{stamp()}.pdf"
+        success = generate_pdf_report(cracks_data, report_path)
+        if success and report_path.exists():
+            return send_file(str(report_path), as_attachment=True,
+                             download_name=report_path.name, mimetype='application/pdf')
+        return "Failed to generate report", 500
+    except Exception as e:
+        return f"Error: {e}", 500
 
 
 # ---------------- MAIN ----------------
 def main():
     print(f"\n{'='*60}")
-    print(f"AUTOMATED PIPELINE INSPECTION SYSTEM - {'Pi 4 Optimized' if IS_PI4 else 'Pi 5'}")
+    print(f"  AUTOMATED PIPELINE INSPECTION SYSTEM — Pi 4 Optimized")
     print(f"{'='*60}")
-    print(f"Model: {MODEL_MODE.upper()}")
-    print(f"Camera Mode: {CAMERA_MODE.upper()}")
-    print(f"Resolution: {CAMERA_WIDTH}x{CAMERA_HEIGHT} @ {CAPTURE_FPS}fps")
-    if IS_PI4:
-        print(f"Frame Skip: Processing every {FRAME_SKIP} frame(s)")
-    print(f"Pipeline: {PIPELINE_LENGTH_METERS}m")
-    print(f"Velocity: {ROBOT_VELOCITY_MPS:.3f} m/s")
-    print(f"Web Interface: http://0.0.0.0:{FLASK_PORT}")
+    print(f"  Web interface : http://0.0.0.0:{FLASK_PORT}")
+    print(f"  From browser  : http://<device-ip>:{FLASK_PORT}")
+    print(f"\n  STEPS:")
+    print(f"  1. Open the URL above in your browser")
+    print(f"  2. Configure pipeline parameters on the setup page")
+    print(f"  3. Click 'Start Inspection System'")
+    print(f"  4. Monitor, pause, stop, or export PDF from the dashboard")
     print(f"{'='*60}\n")
-    
-    # Start camera threads
-    cam0_thread = threading.Thread(target=cam_loop, args=(CAMERA_0_ID, "CAM0", cam0_lock, 'cam0'), daemon=True)
-    cam0_thread.start()
-    
-    if CAMERA_MODE == "dual":
-        cam1_thread = threading.Thread(target=cam_loop, args=(CAMERA_1_ID, "CAM1", cam1_lock, 'cam1'), daemon=True)
-        cam1_thread.start()
-    
-    # Flag update thread
-    def flag_updater():
-        while not stop_event.is_set():
-            update_flags()
-            time.sleep(0.1)
-    
-    flag_thread = threading.Thread(target=flag_updater, daemon=True)
-    flag_thread.start()
-    
-    # Start Flask
+    print("Press Ctrl+C to stop.\n")
+    # Start camera feed immediately so the web UI shows live video from the start
+    threading.Thread(target=cam_loop, args=(CAMERA_0_ID, "CAM0"), daemon=True).start()
     try:
         app.run(host=FLASK_HOST, port=FLASK_PORT, debug=False, threaded=True)
     except KeyboardInterrupt:
         print("\n[SHUTDOWN] Stopping system...")
+        cam_stop_event.set()
         stop_event.set()
-        print("[SHUTDOWN] System stopped")
+        print("[SHUTDOWN] Done.")
 
 
 if __name__ == "__main__":
