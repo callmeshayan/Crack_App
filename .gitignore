@@ -35,7 +35,20 @@ outputs_model/
 images/
 images_batch/
 
+# Old/redundant documentation
+README_OLD.md
+*_OLD.*
+
+# Test files
+test_cam*.jpg
+test_*.py
+
 # Temporary files
 *.tmp
 *.log
 *.cache
+
+# Results and output directories (can be regenerated)
+data/realtime_results/
+data/batch_images_results/
+data/results/

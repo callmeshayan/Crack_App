@@ -14,74 +14,188 @@ import subprocess
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 from collections import deque
-from datetime import datetime
 
 import cv2
 import numpy as np
 from dotenv import load_dotenv
-from inference_sdk import InferenceHTTPClient
-from flask import Flask, Response, render_template_string, jsonify, send_file, request
+from flask import Flask, Response, render_template_string, jsonify, send_file
+from reportlab.lib.pagesizes import letter, A4
+from reportlab.lib import colors
+from reportlab.lib.units import inch
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, Image as RLImage, PageBreak
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.enums import TA_CENTER, TA_LEFT
+from PIL import Image as PILImage
 
+# Conditional imports for online/offline models
 try:
-    from reportlab.lib.pagesizes import letter, A4
-    from reportlab.lib.units import inch
-    from reportlab.lib import colors
-    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, Image as RLImage, PageBreak
-    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-    from reportlab.lib.enums import TA_CENTER, TA_LEFT
-    REPORTLAB_AVAILABLE = True
+    from inference_sdk import InferenceHTTPClient
+    ROBOFLOW_AVAILABLE = True
 except ImportError:
-    REPORTLAB_AVAILABLE = False
-    print("WARNING: reportlab not installed. PDF export will not be available.")
+    ROBOFLOW_AVAILABLE = False
+    print("Warning: inference_sdk not available. Only offline mode will work.")
 
 try:
     from ultralytics import YOLO
     ULTRALYTICS_AVAILABLE = True
 except ImportError:
     ULTRALYTICS_AVAILABLE = False
-    print("WARNING: ultralytics not installed. Offline model will not be available.")
+    print("Warning: ultralytics not available. Only online mode will work.")
 
 # ---------------- ENV ----------------
 load_dotenv(Path(__file__).resolve().parent / ".env", override=True)
 
+# ---------------- INTERACTIVE CONFIGURATION ----------------
+def get_operator_input():
+    """
+    Interactive prompt to get inspection parameters from operator
+    """
+    print("\n" + "="*60)
+    print("AUTOMATED PIPELINE INSPECTION SYSTEM")
+    print("System Configuration")
+    print("="*60 + "\n")
+    
+    # Model selection
+    print("SELECT DETECTION MODEL:")
+    print("  1. On-Device AI Model (YOLOv11n - 68% mAP, Edge Computing)")
+    print("  2. Cloud-Based AI Model (Roboflow API - Real-time Processing)")
+    
+    default_mode = os.getenv("MODEL_MODE", "offline").strip().lower()
+    default_choice = "1" if default_mode == "offline" else "2"
+    
+    while True:
+        choice = input(f"\nEnter choice [1/2] (default: {default_choice}): ").strip() or default_choice
+        if choice in ["1", "2"]:
+            model_mode = "offline" if choice == "1" else "online"
+            break
+        print("Invalid choice. Please enter 1 or 2.")
+    
+    # Pipeline length
+    default_length = os.getenv("PIPELINE_LENGTH", "100.0")
+    print(f"\nPIPELINE LENGTH:")
+    while True:
+        length_input = input(f"  Enter pipeline length in meters (default: {default_length}): ").strip() or default_length
+        try:
+            pipeline_length = float(length_input)
+            if pipeline_length > 0:
+                break
+            print("  Error: Length must be positive.")
+        except ValueError:
+            print("  Error: Please enter a valid number.")
+    
+    # Velocity
+    default_velocity = os.getenv("ROBOT_VELOCITY", "0.5")
+    default_unit = os.getenv("VELOCITY_UNIT", "m/s").lower()
+    
+    print(f"\nROBOT VELOCITY:")
+    print("  Available units: m/s or km/h")
+    
+    while True:
+        unit_input = input(f"  Enter unit [m/s/km/h] (default: {default_unit}): ").strip().lower() or default_unit
+        if unit_input in ["m/s", "km/h"]:
+            velocity_unit = unit_input
+            break
+        print("  Error: Please enter 'm/s' or 'km/h'.")
+    
+    while True:
+        velocity_input = input(f"  Enter velocity in {velocity_unit} (default: {default_velocity}): ").strip() or default_velocity
+        try:
+            velocity = float(velocity_input)
+            if velocity > 0:
+                break
+            print("  Error: Velocity must be positive.")
+        except ValueError:
+            print("  Error: Please enter a valid number.")
+    
+    # Summary
+    print("\n" + "-"*60)
+    print("CONFIGURATION SUMMARY:")
+    print("-"*60)
+    model_name = "On-Device AI Model (YOLOv11n - 68% mAP)" if model_mode == "offline" else "Cloud-Based AI Model (Roboflow API)"
+    print(f"  Detection Model:  {model_name}")
+    print(f"  Pipeline Length:  {pipeline_length:.2f} meters")
+    print(f"  Robot Velocity:   {velocity:.2f} {velocity_unit}")
+    
+    # Convert velocity to m/s
+    if velocity_unit == "km/h":
+        velocity_mps = velocity / 3.6
+    else:
+        velocity_mps = velocity
+    
+    estimated_time = pipeline_length / velocity_mps if velocity_mps > 0 else 0
+    print(f"  Estimated Time:   {estimated_time:.1f} seconds ({estimated_time/60:.1f} minutes)")
+    print("-"*60)
+    
+    confirm = input("\nProceed with this configuration? [Y/n]: ").strip().lower() or 'y'
+    if confirm != 'y':
+        print("Configuration cancelled. Exiting...")
+        exit(0)
+    
+    print("\n[INIT] Starting system with operator configuration...\n")
+    
+    return {
+        'model_mode': model_mode,
+        'pipeline_length': pipeline_length,
+        'velocity': velocity,
+        'velocity_unit': velocity_unit,
+        'velocity_mps': velocity_mps,
+    }
+
+# Get operator input
+operator_config = get_operator_input()
+
+# Apply operator configuration
+MODEL_MODE = operator_config['model_mode']
+PIPELINE_LENGTH_METERS = operator_config['pipeline_length']
+ROBOT_VELOCITY = operator_config['velocity']
+VELOCITY_UNIT = operator_config['velocity_unit']
+ROBOT_VELOCITY_MPS = operator_config['velocity_mps']
+ESTIMATED_INSPECTION_DURATION_SEC = PIPELINE_LENGTH_METERS / ROBOT_VELOCITY_MPS if ROBOT_VELOCITY_MPS > 0 else 600.0
+
+# ---------------- MODEL CONFIGURATION ----------------
+# Path to your trained YOLO model (for offline mode)
+LOCAL_MODEL_PATH = os.getenv(
+    "LOCAL_MODEL_PATH",
+    "/Users/shayannaghashpour/Desktop/--/pipe_crack_ai/runs/detect/train_20260314_134701/weights/best.pt"
+).strip()
+
+# Device for YOLO inference: 'cpu', 'mps' (Mac M1/M2), or '0' (CUDA GPU)
+YOLO_DEVICE = os.getenv("YOLO_DEVICE", "cpu").strip()
+
+# Roboflow configuration (for online mode)
 API_KEY = os.getenv("RF_API_KEY", "").strip()
 WORKSPACE = os.getenv("RF_WORKSPACE", "").strip()
-WORKFLOW_ID = os.getenv("RF_WORKFLOW_ID", "find-cracks-2").strip()
-MODEL_ID = os.getenv("RF_MODEL_ID", "find-cracks-2").strip()
-MODEL_MODE = os.getenv("MODEL_MODE", "online").strip().lower()  # online or offline
-LOCAL_MODEL_PATH = os.getenv("LOCAL_MODEL_PATH", "models/best.pt").strip()
+WORKFLOW_ID = os.getenv("RF_WORKFLOW_ID", "").strip()
 
-if not API_KEY or not WORKSPACE:
-    print("WARNING: Missing Roboflow API credentials. Only offline mode will work.")
-
-# Available models configuration - Main models only
-AVAILABLE_MODELS = {
-    "find-cracks-2": {"name": "Roboflow", "workflow": "find-cracks-2", "mode": "online"},
-    "offline-yolo": {"name": "pipe_crack_ai (68% Accuracy)", "workflow": "offline", "mode": "offline"},
-}
-
-CURRENT_MODEL = MODEL_ID
-
-# Initialize models
-model_offline = None
+# Initialize model based on mode
 client = None
+local_model = None
 
-if API_KEY and WORKSPACE:
+if MODEL_MODE == "online":
+    if not ROBOFLOW_AVAILABLE:
+        raise ValueError("Online mode selected but inference_sdk not installed. Install with: pip install inference-sdk")
+    if not API_KEY or not WORKSPACE or not WORKFLOW_ID:
+        raise ValueError("Online mode requires .env vars: RF_API_KEY, RF_WORKSPACE, RF_WORKFLOW_ID")
     client = InferenceHTTPClient(
         api_url="https://serverless.roboflow.com",
         api_key=API_KEY,
     )
-    print("✓ Roboflow client initialized for online inference")
-
-# Try to load offline model if available
-if ULTRALYTICS_AVAILABLE and Path(LOCAL_MODEL_PATH).exists():
-    try:
-        model_offline = YOLO(LOCAL_MODEL_PATH)
-        print(f"✓ Offline YOLO model loaded from {LOCAL_MODEL_PATH}")
-    except Exception as e:
-        print(f"WARNING: Could not load offline model: {e}")
-elif ULTRALYTICS_AVAILABLE:
-    print(f"WARNING: Offline model file not found: {LOCAL_MODEL_PATH}")
+    print(f"[INIT] Cloud-Based AI Model initialized successfully")
+elif MODEL_MODE == "offline":
+    if not ULTRALYTICS_AVAILABLE:
+        raise ValueError("Offline mode selected but ultralytics not installed. Install with: pip install ultralytics")
+    if not Path(LOCAL_MODEL_PATH).exists():
+        raise ValueError(f"Local model not found at: {LOCAL_MODEL_PATH}")
+    # Load model with CPU/MPS for Raspberry Pi compatibility
+    local_model = YOLO(LOCAL_MODEL_PATH)
+    print(f"[INIT] On-Device AI Model initialized successfully (YOLOv11n - 68% mAP)")
+    print(f"[INIT] Model path: {LOCAL_MODEL_PATH}")
+    print(f"[INIT] Compute device: {YOLO_DEVICE.upper()}")
+    print(f"[INIT] Robot velocity: {ROBOT_VELOCITY} {VELOCITY_UNIT} ({ROBOT_VELOCITY_MPS:.3f} m/s)")
+    print(f"[INIT] Pipeline length: {PIPELINE_LENGTH_METERS}m")
+    print(f"[INIT] Estimated inspection time: {ESTIMATED_INSPECTION_DURATION_SEC:.1f}s ({ESTIMATED_INSPECTION_DURATION_SEC/60:.1f} min)")
+else:
+    raise ValueError(f"Invalid MODEL_MODE: {MODEL_MODE}. Must be 'online' or 'offline'")
 
 # ---------------- SETTINGS ----------------
 CONF_THRESH = float(os.getenv("RF_CONF", "0.5"))
@@ -101,26 +215,12 @@ SEVERITY_MEDIUM = 0.55
 
 BOOLEAN_DURATION_S = 1.0
 
-# ---------- PIPELINE LOCALIZATION SETTINGS ----------
-# IMPORTANT: These settings enable crack position estimation for live inspection
-# Position is estimated based on elapsed time assuming constant robot speed
-
-# Set your pipeline length in meters
-PIPELINE_LENGTH_METERS = 100.0  # Default - can be changed via webapp
-
-# Robot velocity in meters per second (default 0.167 m/s = 10 m/min)
-ROBOT_VELOCITY_MPS = 0.167  # Default - can be changed via webapp
-
-# Calculate inspection duration based on velocity
-ESTIMATED_INSPECTION_DURATION_SEC = PIPELINE_LENGTH_METERS / ROBOT_VELOCITY_MPS if ROBOT_VELOCITY_MPS > 0 else 600.0
-
 # Enable/disable position tracking
 ENABLE_POSITION_TRACKING = True
 
 CAMERA_WIDTH = 640
 CAMERA_HEIGHT = 480
 CAPTURE_FPS = 30
-STREAM_JPEG_QUALITY = 70  # Reduce for faster streaming (50-90 range)
 
 CAMERA_0_ID = 0
 CAMERA_1_ID = 1
@@ -146,63 +246,70 @@ def stamp() -> str:
     return time.strftime("%Y%m%d_%H%M%S")
 
 
-def estimate_crack_position(elapsed_sec: float, estimated_duration_sec: float, pipeline_length_m: float) -> float:
+def estimate_crack_position(elapsed_sec: float, velocity_mps: float, pipeline_length_m: float) -> float:
     """
-    Estimate crack position along the pipeline based on elapsed time.
+    Estimate crack position along the pipeline based on elapsed time and robot velocity.
     
     IMPORTANT: This is an APPROXIMATE estimate assuming constant robot speed.
     The actual position may vary if the robot speed changes during inspection.
     
-    Formula: position_m = pipeline_length_m * (elapsed_time / total_inspection_time)
+    Formula: position_m = velocity_mps * elapsed_time
     
     Args:
         elapsed_sec: Time elapsed since inspection start (seconds)
-        estimated_duration_sec: Expected total inspection duration (seconds)
+        velocity_mps: Robot velocity in meters per second
         pipeline_length_m: Total pipeline length in meters
     
     Returns:
-        Estimated position in meters from pipe entrance
+        Estimated position in meters from pipe entrance (clamped to pipeline length)
     """
-    if not ENABLE_POSITION_TRACKING or estimated_duration_sec <= 0:
+    if not ENABLE_POSITION_TRACKING or velocity_mps <= 0:
         return 0.0
     
-    # Clamp elapsed time to valid range
-    elapsed_sec = max(0.0, min(elapsed_sec, estimated_duration_sec))
+    # Calculate position: distance = velocity * time
+    position_m = velocity_mps * elapsed_sec
     
-    # Proportional calculation based on time progress
-    # Estimated crack location from pipe entrance
-    # position_m = pipeline_length_m * (elapsed_time / total_inspection_time)
-    position_m = pipeline_length_m * (elapsed_sec / estimated_duration_sec)
+    # Clamp to pipeline length
+    position_m = max(0.0, min(position_m, pipeline_length_m))
     
     return position_m
 
 
 def extract_predictions(result: Any) -> List[Dict[str, Any]]:
-    """Extract predictions from both Roboflow and YOLO results"""
-    # YOLO Results object
+    """Extract predictions from Roboflow workflow result or YOLO result object"""
+    # Handle YOLO Results object (offline mode)
     if hasattr(result, 'boxes'):
         predictions = []
         boxes = result.boxes
-        for i in range(len(boxes)):
-            box = boxes[i]
-            xyxy = box.xyxy[0].tolist()
-            x_center = (xyxy[0] + xyxy[2]) / 2
-            y_center = (xyxy[1] + xyxy[3]) / 2
-            width = xyxy[2] - xyxy[0]
-            height = xyxy[3] - xyxy[1]
-            
-            predictions.append({
-                'x': x_center,
-                'y': y_center,
-                'width': width,
-                'height': height,
-                'confidence': float(box.conf[0]),
-                'class': result.names[int(box.cls[0])],
-                'class_id': int(box.cls[0])
-            })
+        if boxes is not None and len(boxes) > 0:
+            for i in range(len(boxes)):
+                box = boxes[i]
+                # YOLO format: xyxy, confidence, class
+                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                conf = float(box.conf[0].cpu().numpy())
+                cls = int(box.cls[0].cpu().numpy())
+                
+                # Convert to center format (like Roboflow)
+                x_center = (x1 + x2) / 2
+                y_center = (y1 + y2) / 2
+                width = x2 - x1
+                height = y2 - y1
+                
+                # Get class name
+                class_name = result.names[cls] if hasattr(result, 'names') else str(cls)
+                
+                predictions.append({
+                    "x": x_center,
+                    "y": y_center,
+                    "width": width,
+                    "height": height,
+                    "confidence": conf,
+                    "class": class_name,
+                    "class_name": class_name,
+                })
         return predictions
     
-    # Roboflow workflow result
+    # Handle Roboflow workflow result (online mode)
     if isinstance(result, list):
         for item in result:
             preds = extract_predictions(item)
@@ -274,6 +381,53 @@ def classify_severity(confidence: float) -> str:
     return "LOW"
 
 
+def draw_location_indicator(frame: np.ndarray, position_m: float, pipeline_length_m: float, 
+                            velocity: float, velocity_unit: str) -> np.ndarray:
+    """Draw visual location indicator on the frame"""
+    h, w = frame.shape[:2]
+    
+    # Draw info panel background
+    panel_height = 120
+    panel = np.zeros((panel_height, w, 3), dtype=np.uint8)
+    panel[:] = (40, 40, 40)  # Dark gray background
+    
+    # Title
+    cv2.putText(panel, "PIPELINE LOCATION", (10, 25), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+    
+    # Position bar
+    bar_x = 10
+    bar_y = 40
+    bar_width = w - 20
+    bar_height = 30
+    
+    # Background bar
+    cv2.rectangle(panel, (bar_x, bar_y), (bar_x + bar_width, bar_y + bar_height), 
+                 (80, 80, 80), -1)
+    
+    # Progress bar
+    progress = min(position_m / pipeline_length_m, 1.0) if pipeline_length_m > 0 else 0
+    progress_width = int(bar_width * progress)
+    cv2.rectangle(panel, (bar_x, bar_y), (bar_x + progress_width, bar_y + bar_height), 
+                 (0, 200, 100), -1)
+    
+    # Position marker
+    marker_x = bar_x + progress_width
+    cv2.circle(panel, (marker_x, bar_y + bar_height // 2), 8, (255, 255, 255), -1)
+    cv2.circle(panel, (marker_x, bar_y + bar_height // 2), 8, (0, 255, 0), 2)
+    
+    # Text information
+    info_y = bar_y + bar_height + 25
+    cv2.putText(panel, f"Position: {position_m:.2f}m / {pipeline_length_m:.1f}m", 
+                (10, info_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+    cv2.putText(panel, f"Velocity: {velocity:.2f} {velocity_unit}", 
+                (w - 200, info_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+    
+    # Combine panel with frame
+    result = np.vstack([panel, frame])
+    return result
+
+
 def draw_detections(frame: np.ndarray, preds: List[Dict[str, Any]], position_m: float = 0.0) -> np.ndarray:
     """Draw detections with optional position information"""
     for pred in preds:
@@ -310,6 +464,145 @@ def draw_detections(frame: np.ndarray, preds: List[Dict[str, Any]], position_m: 
         cv2.rectangle(frame, (x1, y1 - th_text - 10), (x1 + tw, y1), color, -1)
         cv2.putText(frame, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
     return frame
+
+
+# ---------------- PDF REPORT GENERATION ----------------
+def generate_pdf_report(output_path: Path, inspection_data: Dict[str, Any]) -> bool:
+    """
+    Generate a professional PDF report of the pipeline inspection
+    
+    Args:
+        output_path: Path where PDF will be saved
+        inspection_data: Dictionary containing inspection results and metadata
+    
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        doc = SimpleDocTemplate(str(output_path), pagesize=A4)
+        story = []
+        styles = getSampleStyleSheet()
+        
+        # Custom styles
+        title_style = ParagraphStyle(
+            'CustomTitle',
+            parent=styles['Heading1'],
+            fontSize=24,
+            textColor=colors.HexColor('#1a1a2e'),
+            spaceAfter=30,
+            alignment=TA_CENTER
+        )
+        
+        heading_style = ParagraphStyle(
+            'CustomHeading',
+            parent=styles['Heading2'],
+            fontSize=14,
+            textColor=colors.HexColor('#16213e'),
+            spaceAfter=12,
+            spaceBefore=12
+        )
+        
+        # Title
+        story.append(Paragraph("Automated Pipeline Inspection Report", title_style))
+        story.append(Spacer(1, 0.3*inch))
+        
+        # Inspection Summary
+        story.append(Paragraph("Inspection Summary", heading_style))
+        
+        summary_data = [
+            ['Parameter', 'Value'],
+            ['Inspection Date', inspection_data.get('date', 'N/A')],
+            ['Pipeline Length', f"{inspection_data.get('pipeline_length', 0):.1f} m"],
+            ['Robot Velocity', f"{inspection_data.get('velocity', 0):.2f} {inspection_data.get('velocity_unit', 'm/s')}"],
+            ['Inspection Duration', f"{inspection_data.get('duration', 0):.1f} sec ({inspection_data.get('duration', 0)/60:.1f} min)"],
+            ['Model Mode', inspection_data.get('model_mode', 'N/A').upper()],
+            ['Total Frames Processed', str(inspection_data.get('total_frames', 0))],
+            ['Total Cracks Detected', str(inspection_data.get('total_cracks', 0))],
+        ]
+        
+        summary_table = Table(summary_data, colWidths=[3*inch, 3*inch])
+        summary_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#16213e')),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+            ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, 0), 12),
+            ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+            ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+            ('GRID', (0, 0), (-1, -1), 1, colors.black),
+        ]))
+        story.append(summary_table)
+        story.append(Spacer(1, 0.3*inch))
+        
+        # Severity Breakdown
+        story.append(Paragraph("Severity Breakdown", heading_style))
+        
+        severity_data = [
+            ['Severity Level', 'Count', 'Percentage'],
+            ['CRITICAL', str(inspection_data.get('critical_count', 0)), 
+             f"{inspection_data.get('critical_count', 0) / max(inspection_data.get('total_cracks', 1), 1) * 100:.1f}%"],
+            ['HIGH', str(inspection_data.get('high_count', 0)),
+             f"{inspection_data.get('high_count', 0) / max(inspection_data.get('total_cracks', 1), 1) * 100:.1f}%"],
+            ['MEDIUM', str(inspection_data.get('medium_count', 0)),
+             f"{inspection_data.get('medium_count', 0) / max(inspection_data.get('total_cracks', 1), 1) * 100:.1f}%"],
+            ['LOW', str(inspection_data.get('low_count', 0)),
+             f"{inspection_data.get('low_count', 0) / max(inspection_data.get('total_cracks', 1), 1) * 100:.1f}%"],
+        ]
+        
+        severity_table = Table(severity_data, colWidths=[2*inch, 2*inch, 2*inch])
+        severity_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#16213e')),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, 0), 11),
+            ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+            ('BACKGROUND', (0, 1), (0, 1), colors.HexColor('#ff4444')),
+            ('BACKGROUND', (0, 2), (0, 2), colors.HexColor('#ff8800')),
+            ('BACKGROUND', (0, 3), (0, 3), colors.HexColor('#ffcc00')),
+            ('BACKGROUND', (0, 4), (0, 4), colors.HexColor('#44ff44')),
+            ('GRID', (0, 0), (-1, -1), 1, colors.black),
+        ]))
+        story.append(severity_table)
+        story.append(Spacer(1, 0.3*inch))
+        
+        # Detailed Crack List
+        if inspection_data.get('cracks', []):
+            story.append(PageBreak())
+            story.append(Paragraph("Detailed Crack Locations", heading_style))
+            
+            crack_data = [['ID', 'Position (m)', 'Confidence', 'Severity', 'Camera']]
+            for crack in inspection_data.get('cracks', [])[:50]:  # Limit to first 50
+                crack_data.append([
+                    str(crack.get('crack_id', 'N/A')),
+                    f"{crack.get('position_m', 0):.2f}",
+                    f"{crack.get('confidence', 0):.2f}",
+                    crack.get('severity', 'N/A'),
+                    f"CAM{crack.get('camera_id', 0)}",
+                ])
+            
+            crack_table = Table(crack_data, colWidths=[0.8*inch, 1.5*inch, 1.5*inch, 1.5*inch, 1.2*inch])
+            crack_table.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#16213e')),
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                ('FONTSIZE', (0, 0), (-1, -1), 9),
+                ('BOTTOMPADDING', (0, 0), (-1, 0), 8),
+                ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+                ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.lightgrey]),
+            ]))
+            story.append(crack_table)
+        
+        # Build PDF
+        doc.build(story)
+        return True
+        
+    except Exception as e:
+        print(f"[PDF] Error generating report: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
 
 
 # ---------------- STATE ----------------
@@ -406,7 +699,7 @@ class CameraState:
         if not ENABLE_POSITION_TRACKING:
             return 0.0
         elapsed = self.get_elapsed_time()
-        return estimate_crack_position(elapsed, ESTIMATED_INSPECTION_DURATION_SEC, PIPELINE_LENGTH_METERS)
+        return estimate_crack_position(elapsed, ROBOT_VELOCITY_MPS, PIPELINE_LENGTH_METERS)
     
     def increment_crack_counter(self) -> int:
         """Increment and return crack counter"""
@@ -516,29 +809,6 @@ def inference_loop(cam_state: CameraState):
     min_interval = 1.0 / max(INFER_FPS, 0.1)
     last_infer_time = 0.0
     last_saved_found = 0.0
-    
-    # Wait for project to be configured
-    while not project_config.get("initialized", False) and not cam_state.stop_flag:
-        time.sleep(0.1)
-    
-    # Determine which model to use based on config
-    with config_lock:
-        model_id = project_config.get("model_id", "find-cracks-2")
-        use_offline = (model_id == "offline-yolo")
-    
-    if use_offline:
-        if not model_offline:
-            print(f"[CAM{cam_state.camera_id}] ERROR: Offline model selected but model file not found at {LOCAL_MODEL_PATH}!")
-            print(f"[CAM{cam_state.camera_id}] Please deploy the model from pipe_crack_ai or switch to Roboflow model.")
-            return
-        model_name = "YOLO (Offline)"
-    else:
-        if not client:
-            print(f"[CAM{cam_state.camera_id}] ERROR: Online model selected but Roboflow client not initialized!")
-            return
-        model_name = "Roboflow (Online)"
-    
-    print(f"[CAM{cam_state.camera_id}] Inference loop started with {model_name}")
 
     while not cam_state.stop_flag:
         now = time.time()
@@ -584,18 +854,13 @@ def inference_loop(cam_state: CameraState):
         last_infer_time = now
         processed = preprocess_frame(frame)
 
-        ok, jpg = cv2.imencode(".jpg", processed)
-        if not ok:
-            continue
-
         try:
-            # Run inference based on model type
-            if use_offline:
-                # Offline YOLO inference
-                results = model_offline(processed, conf=CONF_THRESH, verbose=False)
-                result = results[0] if results else None
-            else:
+            if MODEL_MODE == "online":
                 # Online Roboflow inference
+                ok, jpg = cv2.imencode(".jpg", processed)
+                if not ok:
+                    continue
+                
                 with tempfile.NamedTemporaryFile(suffix=".jpg", delete=True) as f:
                     f.write(jpg.tobytes())
                     f.flush()
@@ -606,6 +871,23 @@ def inference_loop(cam_state: CameraState):
                         images={"image": f.name},
                         use_cache=True,
                     )
+            else:
+                # Offline local YOLO inference
+                # Run inference on preprocessed frame
+                # YOLO already filters by conf threshold, so we pass it directly
+                results = local_model.predict(
+                    source=processed,
+                    conf=CONF_THRESH,
+                    verbose=False,
+                    device=YOLO_DEVICE,
+                    half=False,  # Use FP32 for better compatibility
+                    imgsz=640,  # Match training size
+                )
+                # Get first result (single image)
+                result = results[0] if results and len(results) > 0 else None
+                if result is None:
+                    print(f"[CAM{cam_state.camera_id}] Warning: YOLO returned no results")
+                    continue
 
             with cam_state.stats_lock:
                 cam_state.stats["processed_frames"] += 1
@@ -690,14 +972,35 @@ def inference_loop(cam_state: CameraState):
 
                     annotated_raw = draw_detections(frame.copy(), [pred], position_m)
                     annotated_enhanced = draw_detections(processed.copy(), [pred], position_m)
+                    
+                    # Add location indicator to annotated images
+                    annotated_raw_with_loc = draw_location_indicator(
+                        annotated_raw, position_m, PIPELINE_LENGTH_METERS, 
+                        ROBOT_VELOCITY, VELOCITY_UNIT
+                    )
+                    annotated_enhanced_with_loc = draw_location_indicator(
+                        annotated_enhanced, position_m, PIPELINE_LENGTH_METERS,
+                        ROBOT_VELOCITY, VELOCITY_UNIT
+                    )
 
+                    # Prepare serializable result data
+                    if MODEL_MODE == "online":
+                        result_data = result
+                    else:
+                        # For YOLO results, extract only serializable data
+                        result_data = {
+                            "model_type": "yolo",
+                            "inference_time_ms": getattr(result, 'speed', {}).get('inference', 0) if hasattr(result, 'speed') else 0,
+                            "predictions": [pred],  # Already contains the specific prediction
+                        }
+                    
                     metadata = {
                         "crack_id": crack_id,
                         "camera_id": cam_state.camera_id,
                         "elapsed_sec": elapsed,
                         "position_m": position_m,
                         "pipeline_length_m": PIPELINE_LENGTH_METERS,
-                        "result": result,
+                        "result": result_data,
                         "blur_score": blur_score,
                         "detections": 1,
                         "confidence": conf,
@@ -705,6 +1008,7 @@ def inference_loop(cam_state: CameraState):
                         "area_px": area,
                         "class": class_name,
                         "timestamp": t,
+                        "model_mode": MODEL_MODE,
                         "preprocessing_enabled": ENABLE_PREPROCESSING,
                         "persistence_enabled": ENABLE_PERSISTENCE,
                         "persistence_frames": PERSISTENCE_FRAMES,
@@ -714,15 +1018,15 @@ def inference_loop(cam_state: CameraState):
                     base_found = cam_state.found_dir / name
                     cv2.imwrite(str(base_found) + ".jpg", frame)
                     cv2.imwrite(str(base_found) + "_enhanced.jpg", processed)
-                    cv2.imwrite(str(base_found) + "_annotated.jpg", annotated_raw)
-                    cv2.imwrite(str(base_found) + "_enhanced_annotated.jpg", annotated_enhanced)
+                    cv2.imwrite(str(base_found) + "_annotated.jpg", annotated_raw_with_loc)
+                    cv2.imwrite(str(base_found) + "_enhanced_annotated.jpg", annotated_enhanced_with_loc)
                     Path(str(base_found) + ".json").write_text(json.dumps(metadata, indent=2, default=str))
 
                     base_rt = cam_state.realtime_dir / name
                     cv2.imwrite(str(base_rt) + ".jpg", frame)
                     cv2.imwrite(str(base_rt) + "_enhanced.jpg", processed)
-                    cv2.imwrite(str(base_rt) + "_annotated.jpg", annotated_raw)
-                    cv2.imwrite(str(base_rt) + "_enhanced_annotated.jpg", annotated_enhanced)
+                    cv2.imwrite(str(base_rt) + "_annotated.jpg", annotated_raw_with_loc)
+                    cv2.imwrite(str(base_rt) + "_enhanced_annotated.jpg", annotated_enhanced_with_loc)
                     Path(str(base_rt) + ".json").write_text(json.dumps(metadata, indent=2, default=str))
                     
                     # Write to CSV
@@ -809,296 +1113,11 @@ app = Flask(__name__)
 cam0 = None
 cam1 = None
 
-# Project configuration state
-project_config = {
-    "initialized": False,
-    "pipeline_length": PIPELINE_LENGTH_METERS,
-    "robot_velocity": ROBOT_VELOCITY_MPS,
-    "inspection_duration": ESTIMATED_INSPECTION_DURATION_SEC,
-    "model_id": CURRENT_MODEL,
-    "enable_camera0": True,
-    "enable_camera1": True,
-    "started": False,
-    "paused": False,
-}
-config_lock = threading.Lock()
-
-CONFIG_TEMPLATE = """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Project Configuration - Pipeline Crack Detection</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-        body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
-            color: #fff;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            min-height: 100vh;
-            padding: 20px;
-        }
-        .config-container {
-            background: rgba(255, 255, 255, 0.05);
-            border-radius: 20px;
-            padding: 40px;
-            max-width: 600px;
-            width: 100%;
-            backdrop-filter: blur(10px);
-            border: 2px solid rgba(0, 255, 136, 0.3);
-            box-shadow: 0 10px 50px rgba(0, 0, 0, 0.5);
-        }
-        h1 {
-            color: #00ff88;
-            font-size: 2.5em;
-            text-align: center;
-            margin-bottom: 10px;
-            text-shadow: 0 0 20px rgba(0, 255, 136, 0.5);
-        }
-        .subtitle {
-            text-align: center;
-            opacity: 0.7;
-            margin-bottom: 30px;
-        }
-        .form-group {
-            margin-bottom: 25px;
-        }
-        label {
-            display: block;
-            margin-bottom: 8px;
-            color: #00ff88;
-            font-weight: 600;
-        }
-        .help-text {
-            font-size: 0.85em;
-            opacity: 0.7;
-            margin-top: 5px;
-        }
-        input[type="number"], input[type="text"] {
-            width: 100%;
-            padding: 12px;
-            border-radius: 8px;
-            border: 2px solid rgba(255, 255, 255, 0.2);
-            background: rgba(255, 255, 255, 0.05);
-            color: #fff;
-            font-size: 1em;
-            transition: all 0.3s;
-        }
-        input[type="number"]:focus, input[type="text"]:focus {
-            outline: none;
-            border-color: #00ff88;
-            background: rgba(0, 255, 136, 0.05);
-        }
-        .checkbox-group {
-            display: flex;
-            gap: 20px;
-            margin-top: 10px;
-        }
-        .checkbox-item {
-            display: flex;
-            align-items: center;
-            gap: 8px;
-        }
-        input[type="checkbox"] {
-            width: 20px;
-            height: 20px;
-            cursor: pointer;
-        }
-        .btn {
-            width: 100%;
-            padding: 15px;
-            border-radius: 8px;
-            border: none;
-            background: linear-gradient(135deg, #00ff88 0%, #00cc6a 100%);
-            color: #000;
-            font-size: 1.2em;
-            font-weight: bold;
-            cursor: pointer;
-            transition: all 0.3s;
-            margin-top: 20px;
-        }
-        .btn:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 5px 20px rgba(0, 255, 136, 0.4);
-        }
-        .btn:disabled {
-            opacity: 0.5;
-            cursor: not-allowed;
-            transform: none;
-        }
-        .info-box {
-            background: rgba(0, 136, 255, 0.1);
-            border-left: 4px solid #0088ff;
-            padding: 15px;
-            border-radius: 8px;
-            margin-bottom: 25px;
-        }
-        .info-box h3 {
-            color: #0088ff;
-            margin-bottom: 8px;
-        }
-        .error {
-            background: rgba(255, 0, 0, 0.1);
-            border: 1px solid #ff0000;
-            padding: 10px;
-            border-radius: 5px;
-            margin-top: 10px;
-            display: none;
-        }
-    </style>
-</head>
-<body>
-    <div class="config-container">
-        <h1>🔧 Project Setup</h1>
-        <p class="subtitle">Configure your pipeline inspection parameters</p>
-        
-        <div class="info-box">
-            <h3>ℹ️ Before You Start</h3>
-            <p>Set up your pipeline parameters for accurate crack position tracking. These settings can be adjusted based on your robot's speed and pipeline dimensions.</p>
-        </div>
-        
-        <form id="configForm">
-            <div class="form-group">
-                <label for="pipelineLength">Pipeline Length (meters)</label>
-                <input type="number" id="pipelineLength" value="100" min="1" max="10000" step="0.1" required>
-                <p class="help-text">Total length of the pipeline to inspect</p>
-            </div>
-            
-            <div class="form-group">
-                <label for="robotVelocity">Robot Velocity</label>
-                <div style="display: flex; gap: 10px;">
-                    <input type="number" id="robotVelocity" value="0.6" min="0.01" max="100" step="0.001" required style="flex: 1;">
-                    <select id="velocityUnit" style="width: 100px;">
-                        <option value="kmh" selected>km/h</option>
-                        <option value="ms">m/s</option>
-                    </select>
-                </div>
-                <p class="help-text">Speed of the robot (Default: 0.6 km/h = 0.167 m/s = 10 m/min)</p>
-            </div>
-            
-            <div class="form-group">
-                <label for="modelSelect">Detection Model</label>
-                <select id="modelSelect" required>
-                    <option value="find-cracks-2" selected>Roboflow</option>
-                    <option value="offline-yolo">pipe_crack_ai (68% Accuracy)</option>
-                </select>
-                <p class="help-text">Select the detection model for crack identification</p>
-            </div>
-            
-            <div class="form-group">
-                <label>Camera Configuration</label>
-                <div class="checkbox-group">
-                    <div class="checkbox-item">
-                        <input type="checkbox" id="enableCamera0" checked>
-                        <label for="enableCamera0" style="margin: 0;">Camera 0 (Primary)</label>
-                    </div>
-                    <div class="checkbox-item">
-                        <input type="checkbox" id="enableCamera1" checked>
-                        <label for="enableCamera1" style="margin: 0;">Camera 1 (Secondary)</label>
-                    </div>
-                </div>
-                <p class="help-text">Select which cameras to use for inspection</p>
-            </div>
-            
-            <div id="calculatedDuration" style="background: rgba(0, 255, 136, 0.1); padding: 15px; border-radius: 8px; margin: 20px 0;">
-                <strong>Estimated Inspection Duration:</strong> <span id="durationValue">600</span> seconds (<span id="durationMinutes">10.0</span> minutes)
-            </div>
-            
-            <button type="submit" class="btn">Start Inspection System</button>
-            
-            <div class="error" id="errorMsg"></div>
-        </form>
-    </div>
-    
-    <script>
-        // Convert velocity to m/s
-        function getVelocityInMS() {
-            const velocity = parseFloat(document.getElementById('robotVelocity').value) || 0.6;
-            const unit = document.getElementById('velocityUnit').value;
-            return unit === 'kmh' ? velocity / 3.6 : velocity;  // km/h to m/s: divide by 3.6
-        }
-        
-        // Calculate duration dynamically
-        function updateDuration() {
-            const length = parseFloat(document.getElementById('pipelineLength').value) || 100;
-            const velocityMS = getVelocityInMS();
-            const duration = velocityMS > 0 ? (length / velocityMS) : 600;
-            const minutes = (duration / 60).toFixed(1);
-            document.getElementById('durationValue').textContent = duration.toFixed(0);
-            document.getElementById('durationMinutes').textContent = minutes;
-        }
-        
-        document.getElementById('pipelineLength').addEventListener('input', updateDuration);
-        document.getElementById('robotVelocity').addEventListener('input', updateDuration);
-        document.getElementById('velocityUnit').addEventListener('change', updateDuration);
-        updateDuration();
-        
-        // Handle form submission
-        document.getElementById('configForm').addEventListener('submit', async function(e) {
-            e.preventDefault();
-            
-            const length = parseFloat(document.getElementById('pipelineLength').value);
-            const velocityMS = getVelocityInMS();  // Always convert to m/s
-            const duration = velocityMS > 0 ? (length / velocityMS) : 600;
-            
-            const config = {
-                pipeline_length: length,
-                robot_velocity: velocityMS,  // Store in m/s
-                inspection_duration: duration,
-                model_id: document.getElementById('modelSelect').value,
-                enable_camera0: document.getElementById('enableCamera0').checked,
-                enable_camera1: document.getElementById('enableCamera1').checked
-            };
-            
-            // Validate at least one camera is enabled
-            if (!config.enable_camera0 && !config.enable_camera1) {
-                document.getElementById('errorMsg').textContent = 'Please enable at least one camera';
-                document.getElementById('errorMsg').style.display = 'block';
-                return;
-            }
-            
-            try {
-                // Save configuration
-                const response = await fetch('/api/config', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify(config)
-                });
-                
-                if (!response.ok) throw new Error('Configuration failed');
-                
-                // Start project
-                const startResponse = await fetch('/api/start_project', {
-                    method: 'POST'
-                });
-                
-                if (!startResponse.ok) throw new Error('Failed to start project');
-                
-                // Redirect to dashboard
-                window.location.href = '/';
-                
-            } catch (error) {
-                document.getElementById('errorMsg').textContent = 'Error: ' + error.message;
-                document.getElementById('errorMsg').style.display = 'block';
-            }
-        });
-    </script>
-</body>
-</html>
-"""
-
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Pipeline Crack Detection System</title>
+    <title>Automated Pipeline Inspection System</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <style>
         * {
@@ -1122,6 +1141,23 @@ HTML_TEMPLATE = """
             font-size: 2.5em;
             text-shadow: 0 0 20px rgba(0, 255, 136, 0.5);
             margin-bottom: 10px;
+        }
+        .model-badge {
+            display: inline-block;
+            padding: 5px 15px;
+            border-radius: 20px;
+            font-size: 0.5em;
+            font-weight: bold;
+            margin-left: 15px;
+            vertical-align: middle;
+        }
+        .model-badge.offline {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            box-shadow: 0 4px 15px rgba(102, 126, 234, 0.4);
+        }
+        .model-badge.online {
+            background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+            box-shadow: 0 4px 15px rgba(245, 87, 108, 0.4);
         }
         .stats-bar {
             display: flex;
@@ -1356,28 +1392,6 @@ HTML_TEMPLATE = """
             border-radius: 50%;
         }
         
-        /* Control Buttons */
-        .control-btn {
-            padding: 12px 25px;
-            border-radius: 8px;
-            border: none;
-            background: linear-gradient(135deg, #00ff88 0%, #00cc6a 100%);
-            color: #000;
-            font-size: 1.1em;
-            font-weight: bold;
-            cursor: pointer;
-            transition: all 0.3s;
-        }
-        .control-btn:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 5px 20px rgba(0, 255, 136, 0.4);
-        }
-        .control-btn:disabled {
-            opacity: 0.5;
-            cursor: not-allowed;
-            transform: none;
-        }
-        
         /* Responsive */
         @media (max-width: 768px) {
             h1 {
@@ -1391,11 +1405,57 @@ HTML_TEMPLATE = """
                 margin: 10% auto;
             }
         }
+        
+        /* Unit Selectors */
+        .unit-controls {
+            display:flex; gap:15px; justify-content:center;
+            margin-top:15px; flex-wrap:wrap;
+            padding:10px;
+        }
+        .unit-group {
+            display:flex; flex-direction:column; align-items:center;
+        }
+        .unit-label {
+            font-size:0.85em; color:#667eea; margin-bottom:5px;
+            opacity:0.9; font-weight:bold;
+        }
+        .unit-selector {
+            padding:8px 15px; border-radius:8px;
+            border:2px solid #667eea; background:white;
+            color:#667eea; font-size:0.9em; font-weight:bold;
+            cursor:pointer; transition:all 0.3s;
+        }
+        .unit-selector:hover {
+            background:#667eea;
+            color:white;
+            box-shadow:0 4px 15px rgba(102, 126, 234, 0.4);
+        }
     </style>
 </head>
 <body>
     <div class="header">
-        <h1>🔍 Pipeline Crack Detection System</h1>
+        <h1>
+            Automated Pipeline Inspection System
+            <span class="model-badge {{ model_mode }}">{{ model_mode_display }}</span>
+        </h1>
+        <div class="unit-controls">
+            <div class="unit-group">
+                <div class="unit-label">Length Unit</div>
+                <select class="unit-selector" id="length-unit" onchange="updateUnits()">
+                    <option value="m" selected>Meters (m)</option>
+                    <option value="cm">Centimeters (cm)</option>
+                    <option value="km">Kilometers (km)</option>
+                </select>
+            </div>
+            <div class="unit-group">
+                <div class="unit-label">Velocity Unit</div>
+                <select class="unit-selector" id="velocity-unit" onchange="updateUnits()">
+                    <option value="m/s" selected>m/s</option>
+                    <option value="mm/s">mm/s</option>
+                    <option value="km/h">km/h</option>
+                </select>
+            </div>
+        </div>
     </div>
     
     <div class="stats-bar">
@@ -1404,16 +1464,12 @@ HTML_TEMPLATE = """
             <div class="stat-value" id="pipeline-length">-</div>
         </div>
         <div class="stat-item">
-            <div class="stat-label">Robot Velocity</div>
-            <div class="stat-value" id="robot-velocity">-</div>
-        </div>
-        <div class="stat-item">
-            <div class="stat-label">Model</div>
-            <div class="stat-value" id="model-name" style="font-size: 0.8em;">-</div>
-        </div>
-        <div class="stat-item">
             <div class="stat-label">Current Position</div>
             <div class="stat-value" id="current-position">-</div>
+        </div>
+        <div class="stat-item">
+            <div class="stat-label">Velocity</div>
+            <div class="stat-value" id="velocity">-</div>
         </div>
         <div class="stat-item">
             <div class="stat-label">Total Cracks</div>
@@ -1422,6 +1478,11 @@ HTML_TEMPLATE = """
         <div class="stat-item">
             <div class="stat-label">Critical</div>
             <div class="stat-value" style="color: #ff0000;" id="critical-count">0</div>
+        </div>
+        <div class="stat-item" style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);">
+            <button onclick="generatePDF()" style="background: none; border: 2px solid white; color: white; padding: 10px 20px; border-radius: 5px; cursor: pointer; font-size: 1em; font-weight: bold;">
+                Generate PDF Report
+            </button>
         </div>
     </div>
     
@@ -1453,62 +1514,10 @@ HTML_TEMPLATE = """
         </div>
     </div>
     
-    <!-- Control Panel -->
-    <div class="pipeline-section">
-        <div class="pipeline-title">🎮 Control Panel</div>
-        <div style="display: flex; gap: 15px; flex-wrap: wrap; justify-content: center; margin-top: 20px;">
-            <button class="control-btn" id="pauseBtn" onclick="togglePause()">⏸ Pause</button>
-            <button class="control-btn" id="stopBtn" onclick="stopProject()" style="background: linear-gradient(135deg, #ff4444 0%, #cc0000 100%);">⏹ Stop Project</button>
-            <button class="control-btn" onclick="exportPDF()" style="background: linear-gradient(135deg, #4488ff 0%, #0044aa 100%);">📄 Export PDF Report</button>
-            <button class="control-btn" onclick="window.location.reload()">🔄 Refresh</button>
-        </div>
-        <div id="controlStatus" style="text-align: center; margin-top: 15px; font-size: 1.2em; color: #00ff88;"></div>
-    </div>
-    
     <div class="camera-container">
-        <div class="camera-box" id="camera0-box">
-            <h2>📹 Camera 0 (Primary)</h2>
-            <img src="/video_feed/0" alt="Camera 0" style="border-radius: 10px;">
-            <div style="margin-top: 15px; display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px;">
-                <div style="background: rgba(0,0,0,0.3); padding: 10px; border-radius: 5px;">
-                    <div style="font-size: 0.85em; opacity: 0.7;">Status</div>
-                    <div id="cam0-status" style="font-weight: bold; color: #00ff88;">IDLE</div>
-                </div>
-                <div style="background: rgba(0,0,0,0.3); padding: 10px; border-radius: 5px;">
-                    <div style="font-size: 0.85em; opacity: 0.7;">Detections</div>
-                    <div id="cam0-detections" style="font-weight: bold; color: #00ff88;">0</div>
-                </div>
-                <div style="background: rgba(0,0,0,0.3); padding: 10px; border-radius: 5px;">
-                    <div style="font-size: 0.85em; opacity: 0.7;">Confidence</div>
-                    <div id="cam0-confidence" style="font-weight: bold;">0.00</div>
-                </div>
-                <div style="background: rgba(0,0,0,0.3); padding: 10px; border-radius: 5px;">
-                    <div style="font-size: 0.85em; opacity: 0.7;">Total Cracks</div>
-                    <div id="cam0-total" style="font-weight: bold; color: #ff4444;">0</div>
-                </div>
-            </div>
-        </div>
-        <div class="camera-box" id="camera1-box" style="display: none;">
-            <h2>📹 Camera 1 (Secondary)</h2>
-            <img src="/video_feed/1" alt="Camera 1" style="border-radius: 10px;">
-            <div style="margin-top: 15px; display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px;">
-                <div style="background: rgba(0,0,0,0.3); padding: 10px; border-radius: 5px;">
-                    <div style="font-size: 0.85em; opacity: 0.7;">Status</div>
-                    <div id="cam1-status" style="font-weight: bold; color: #00ff88;">IDLE</div>
-                </div>
-                <div style="background: rgba(0,0,0,0.3); padding: 10px; border-radius: 5px;">
-                    <div style="font-size: 0.85em; opacity: 0.7;">Detections</div>
-                    <div id="cam1-detections" style="font-weight: bold; color: #00ff88;">0</div>
-                </div>
-                <div style="background: rgba(0,0,0,0.3); padding: 10px; border-radius: 5px;">
-                    <div style="font-size: 0.85em; opacity: 0.7;">Confidence</div>
-                    <div id="cam1-confidence" style="font-weight: bold;">0.00</div>
-                </div>
-                <div style="background: rgba(0,0,0,0.3); padding: 10px; border-radius: 5px;">
-                    <div style="font-size: 0.85em; opacity: 0.7;">Total Cracks</div>
-                    <div id="cam1-total" style="font-weight: bold; color: #ff4444;">0</div>
-                </div>
-            </div>
+        <div class="camera-box">
+            <h2>📹 Camera Feed</h2>
+            <img src="/video_feed/0" alt="Camera 0">
         </div>
     </div>
     
@@ -1556,6 +1565,36 @@ HTML_TEMPLATE = """
         const closeBtn = document.getElementsByClassName('close')[0];
         const pipelineContainer = document.getElementById('pipeline-container');
         
+        // Unit conversion functions
+        function convertLength(meters, unit) {
+            switch(unit) {
+                case 'cm': return meters * 100;
+                case 'km': return meters / 1000;
+                default: return meters; // m
+            }
+        }
+
+        function convertVelocity(metersPerSec, unit) {
+            switch(unit) {
+                case 'mm/s': return metersPerSec * 1000;
+                case 'km/h': return metersPerSec * 3.6;
+                default: return metersPerSec; // m/s
+            }
+        }
+
+        function getLengthUnit() {
+            return document.getElementById('length-unit').value;
+        }
+
+        function getVelocityUnit() {
+            return document.getElementById('velocity-unit').value;
+        }
+
+        function updateUnits() {
+            // Re-fetch and update display with new units
+            updatePipeline();
+        }
+        
         closeBtn.onclick = function() {
             modal.style.display = 'none';
         }
@@ -1567,10 +1606,13 @@ HTML_TEMPLATE = """
         }
         
         function showCrackDetail(crack) {
+            const lengthUnit = getLengthUnit();
+            const convertedPosition = convertLength(crack.position_m, lengthUnit);
+            
             document.getElementById('modal-title').textContent = `Crack #${crack.crack_id} Details`;
             document.getElementById('modal-image').src = `/crack_image/${crack.camera_id}/${crack.crack_id}`;
             document.getElementById('modal-crack-id').textContent = crack.crack_id;
-            document.getElementById('modal-position').textContent = crack.position_m.toFixed(2) + ' m';
+            document.getElementById('modal-position').textContent = convertedPosition.toFixed(lengthUnit === 'km' ? 3 : 2) + ' ' + lengthUnit;
             document.getElementById('modal-confidence').textContent = (crack.confidence * 100).toFixed(1) + '%';
             document.getElementById('modal-area').textContent = Math.round(crack.area_px) + ' px²';
             document.getElementById('modal-time').textContent = crack.timestamp_str;
@@ -1587,26 +1629,21 @@ HTML_TEMPLATE = """
                 .then(data => {
                     const pipelineLength = data.pipeline_length_m;
                     const cracks = data.cracks;
+                    const lengthUnit = getLengthUnit();
+                    const velocityUnit = getVelocityUnit();
+                    
+                    // Convert values
+                    const convertedLength = convertLength(pipelineLength, lengthUnit);
+                    const convertedPosition = convertLength(data.current_position_m, lengthUnit);
+                    const velocityMPS = parseFloat(data.velocity) || 0;
+                    const convertedVelocity = convertVelocity(velocityMPS, velocityUnit);
                     
                     // Update stats
-                    document.getElementById('pipeline-length').textContent = pipelineLength.toFixed(1) + 'm';
-                    document.getElementById('pipeline-end').textContent = pipelineLength.toFixed(0) + 'm';
-                    document.getElementById('current-position').textContent = data.current_position_m.toFixed(2) + 'm';
+                    document.getElementById('pipeline-length').textContent = convertedLength.toFixed(lengthUnit === 'km' ? 3 : lengthUnit === 'cm' ? 0 : 1) + lengthUnit;
+                    document.getElementById('pipeline-end').textContent = convertedLength.toFixed(0) + lengthUnit;
+                    document.getElementById('current-position').textContent = convertedPosition.toFixed(lengthUnit === 'km' ? 3 : 2) + lengthUnit;
+                    document.getElementById('velocity').textContent = convertedVelocity.toFixed(velocityUnit === 'km/h' ? 2 : velocityUnit === 'mm/s' ? 0 : 2) + ' ' + velocityUnit;
                     document.getElementById('total-cracks').textContent = cracks.length;
-                    
-                    // Update velocity and model from config
-                    if (data.robot_velocity !== undefined) {
-                        const velocityMS = data.robot_velocity;
-                        const velocityKMH = (velocityMS * 3.6).toFixed(2);
-                        document.getElementById('robot-velocity').textContent = velocityKMH + ' km/h';
-                        document.getElementById('robot-velocity').title = `${velocityMS.toFixed(3)} m/s`;
-                    }
-                    if (data.model_id) {
-                        const modelName = data.model_id === 'find-cracks-2' ? 'Roboflow' : 
-                                        data.model_id === 'offline-yolo' ? 'pipe_crack_ai' : 
-                                        data.model_id;
-                        document.getElementById('model-name').textContent = modelName;
-                    }
                     
                     const criticalCount = cracks.filter(c => c.severity === 'CRITICAL').length;
                     document.getElementById('critical-count').textContent = criticalCount;
@@ -1629,119 +1666,37 @@ HTML_TEMPLATE = """
                 .catch(error => console.error('Error fetching crack data:', error));
         }
         
-        // Update system status and camera feeds
-        function updateSystemStatus() {
-            fetch('/api/system_status')
-                .then(response => response.json())
-                .then(data => {
-                    // Update camera 0 if active
-                    if (data.cameras.camera0) {
-                        const cam0 = data.cameras.camera0;
-                        document.getElementById('cam0-status').textContent = cam0.status.toUpperCase();
-                        document.getElementById('cam0-detections').textContent = cam0.count;
-                        document.getElementById('cam0-confidence').textContent = cam0.confidence.toFixed(2);
-                        document.getElementById('cam0-total').textContent = cam0.total_cracks;
-                        
-                        if (cam0.crack_detected) {
-                            document.getElementById('cam0-status').style.color = '#ff4444';
-                            document.getElementById('cam0-detections').style.color = '#ff4444';
-                        } else {
-                            document.getElementById('cam0-status').style.color = '#00ff88';
-                            document.getElementById('cam0-detections').style.color = '#00ff88';
-                        }
-                    }
-                    
-                    // Update camera 1 if active
-                    if (data.cameras.camera1) {
-                        document.getElementById('camera1-box').style.display = 'block';
-                        const cam1 = data.cameras.camera1;
-                        document.getElementById('cam1-status').textContent = cam1.status.toUpperCase();
-                        document.getElementById('cam1-detections').textContent = cam1.count;
-                        document.getElementById('cam1-confidence').textContent = cam1.confidence.toFixed(2);
-                        document.getElementById('cam1-total').textContent = cam1.total_cracks;
-                        
-                        if (cam1.crack_detected) {
-                            document.getElementById('cam1-status').style.color = '#ff4444';
-                            document.getElementById('cam1-detections').style.color = '#ff4444';
-                        } else {
-                            document.getElementById('cam1-status').style.color = '#00ff88';
-                            document.getElementById('cam1-detections').style.color = '#00ff88';
-                        }
-                    }
-                    
-                    // Update control status
-                    if (data.paused) {
-                        document.getElementById('controlStatus').textContent = '⏸ PAUSED';
-                        document.getElementById('controlStatus').style.color = '#ffaa00';
-                        document.getElementById('pauseBtn').textContent = '▶ Resume';
-                    } else if (data.started) {
-                        document.getElementById('controlStatus').textContent = '▶ RUNNING';
-                        document.getElementById('controlStatus').style.color = '#00ff88';
-                        document.getElementById('pauseBtn').textContent = '⏸ Pause';
-                    }
-                })
-                .catch(error => console.error('Error fetching system status:', error));
-        }
-        
-        // Control functions
-        let isPaused = false;
-        
-        function togglePause() {
-            fetch('/api/pause_project', { method: 'POST' })
-                .then(response => response.json())
-                .then(data => {
-                    if (data.status === 'success') {
-                        isPaused = !isPaused;
-                        updateSystemStatus();
-                    } else {
-                        alert('Error: ' + (data.error || data.message));
-                    }
-                })
-                .catch(error => alert('Error toggling pause: ' + error));
-        }
-        
-        function stopProject() {
-            if (!confirm('Are you sure you want to stop the inspection? This will end the current session.')) {
-                return;
-            }
+        function generatePDF() {
+            const button = event.target;
+            button.textContent = 'Generating...';
+            button.disabled = true;
             
-            fetch('/api/stop_project', { method: 'POST' })
-                .then(response => response.json())
-                .then(data => {
-                    if (data.status === 'success') {
-                        alert('Project stopped. Reloading...');
-                        window.location.reload();
-                    } else {
-                        alert('Error: ' + (data.error || data.message));
-                    }
+            fetch('/generate_report')
+                .then(response => response.blob())
+                .then(blob => {
+                    const url = window.URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = 'pipeline_inspection_report.pdf';
+                    document.body.appendChild(a);
+                    a.click();
+                    window.URL.revokeObjectURL(url);
+                    document.body.removeChild(a);
+                    button.textContent = 'Generate PDF Report';
+                    button.disabled = false;
+                    alert('PDF report generated successfully!');
                 })
-                .catch(error => alert('Error stopping project: ' + error));
-        }
-        
-        function exportPDF() {
-            // Show loading message
-            const statusDiv = document.getElementById('controlStatus');
-            statusDiv.textContent = '📄 Generating PDF report...';
-            statusDiv.style.color = '#4488ff';
-            
-            // Download PDF
-            window.location.href = '/api/export_pdf';
-            
-            // Reset message after delay
-            setTimeout(() => {
-                statusDiv.textContent = '✓ PDF report downloaded';
-                statusDiv.style.color = '#00ff88';
-                setTimeout(() => {
-                    statusDiv.textContent = '';
-                }, 3000);
-            }, 2000);
+                .catch(error => {
+                    console.error('Error generating PDF:', error);
+                    alert('Error generating PDF report. Check console for details.');
+                    button.textContent = 'Generate PDF Report';
+                    button.disabled = false;
+                });
         }
         
         // Update every 2 seconds
         updatePipeline();
-        updateSystemStatus();
         setInterval(updatePipeline, 2000);
-        setInterval(updateSystemStatus, 1000);
     </script>
 </body>
 </html>
@@ -1750,212 +1705,86 @@ HTML_TEMPLATE = """
 
 @app.route('/')
 def index():
-    with config_lock:
-        if not project_config["initialized"]:
-            return render_template_string(CONFIG_TEMPLATE)
-        else:
-            return render_template_string(HTML_TEMPLATE)
-
-
-@app.route('/api/config', methods=['GET', 'POST'])
-def handle_config():
-    global cam0, cam1, project_config, PIPELINE_LENGTH_METERS, ROBOT_VELOCITY_MPS, ESTIMATED_INSPECTION_DURATION_SEC, CURRENT_MODEL, WORKFLOW_ID
-    
-    if request.method == 'POST':
-        data = request.json
-        with config_lock:
-            project_config["pipeline_length"] = float(data.get('pipeline_length', 100.0))
-            project_config["robot_velocity"] = float(data.get('robot_velocity', 0.167))
-            project_config["inspection_duration"] = float(data.get('inspection_duration', 600.0))
-            project_config["model_id"] = data.get('model_id', 'find-cracks-2')
-            project_config["enable_camera0"] = data.get('enable_camera0', True)
-            project_config["enable_camera1"] = data.get('enable_camera1', True)
-            project_config["initialized"] = True
-            
-            # Update global settings
-            PIPELINE_LENGTH_METERS = project_config["pipeline_length"]
-            ROBOT_VELOCITY_MPS = project_config["robot_velocity"]
-            ESTIMATED_INSPECTION_DURATION_SEC = project_config["inspection_duration"]
-            CURRENT_MODEL = project_config["model_id"]
-            
-            # Update workflow ID based on model selection (only for online models)
-            if CURRENT_MODEL in AVAILABLE_MODELS:
-                model_info = AVAILABLE_MODELS[CURRENT_MODEL]
-                if model_info["mode"] == "online":
-                    WORKFLOW_ID = model_info["workflow"]
-                # For offline models, don't update WORKFLOW_ID
-            
-        return jsonify({"status": "success", "message": "Configuration saved"})
-    else:
-        with config_lock:
-            return jsonify(project_config)
-
-
-@app.route('/api/start_project', methods=['POST'])
-def start_project():
-    global cam0, cam1, project_config
-    
-    with config_lock:
-        if not project_config["initialized"]:
-            return jsonify({"error": "Project not configured"}), 400
-        
-        if project_config["started"]:
-            return jsonify({"error": "Project already started"}), 400
-        
-        # Initialize cameras
-        cam0 = CameraState(0, FOUND_DIR_CAM0, REALTIME_FOUND_DIR_CAM0)
-        if project_config["enable_camera1"]:
-            cam1 = CameraState(1, FOUND_DIR_CAM1, REALTIME_FOUND_DIR_CAM1)
-        else:
-            cam1 = None
-        
-        # Start camera 0 if enabled
-        if project_config["enable_camera0"]:
-            t_cap0 = threading.Thread(target=camera_capture_thread, args=(cam0, CAMERA_0_ID), daemon=True)
-            t_inf0 = threading.Thread(target=inference_loop, args=(cam0,), daemon=True)
-            t_cap0.start()
-            t_inf0.start()
-        
-        # Start camera 1 if enabled
-        if project_config["enable_camera1"] and cam1 is not None:
-            t_cap1 = threading.Thread(target=camera_capture_thread, args=(cam1, CAMERA_1_ID), daemon=True)
-            t_inf1 = threading.Thread(target=inference_loop, args=(cam1,), daemon=True)
-            t_cap1.start()
-            t_inf1.start()
-        
-        # Start dashboard
-        active_cams = [c for c in [cam0, cam1] if c is not None]
-        if active_cams:
-            t_dash = threading.Thread(target=dashboard_thread, args=(active_cams,), daemon=True)
-            t_dash.start()
-        
-        project_config["started"] = True
-        project_config["paused"] = False
-        
-    return jsonify({"status": "success", "message": "Project started"})
-
-
-@app.route('/api/pause_project', methods=['POST'])
-def pause_project():
-    global project_config
-    
-    with config_lock:
-        if not project_config["started"]:
-            return jsonify({"error": "Project not started"}), 400
-        
-        project_config["paused"] = not project_config["paused"]
-        
-        # Pause all active cameras
-        if cam0 is not None:
-            cam0.stop_flag = project_config["paused"]
-        if cam1 is not None:
-            cam1.stop_flag = project_config["paused"]
-        
-        status = "paused" if project_config["paused"] else "resumed"
-        return jsonify({"status": "success", "message": f"Project {status}"})
-
-
-@app.route('/api/stop_project', methods=['POST'])
-def stop_project():
-    global cam0, cam1, project_config
-    
-    with config_lock:
-        if not project_config["started"]:
-            return jsonify({"error": "Project not started"}), 400
-        
-        # Stop all cameras
-        if cam0 is not None:
-            cam0.stop_flag = True
-            cam0.close_csv()
-        if cam1 is not None:
-            cam1.stop_flag = True
-            cam1.close_csv()
-        
-        project_config["started"] = False
-        project_config["paused"] = False
-        
-    return jsonify({"status": "success", "message": "Project stopped"})
-
-
-@app.route('/api/system_status')
-def system_status():
-    """Get overall system status"""
-    status = {
-        "initialized": project_config["initialized"],
-        "started": project_config["started"],
-        "paused": project_config["paused"],
-        "pipeline_length": project_config["pipeline_length"],
-        "inspection_duration": project_config["inspection_duration"],
-        "cameras": {}
-    }
-    
-    if cam0 is not None:
-        with cam0.result_lock:
-            cam0_result = dict(cam0.latest_result)
-        with cam0.stats_lock:
-            cam0_stats = dict(cam0.stats)
-        
-        status["cameras"]["camera0"] = {
-            "active": project_config["enable_camera0"],
-            "status": cam0_result.get("status", "unknown"),
-            "crack_detected": cam0_result.get("count", 0) > 0,
-            "confidence": cam0_result.get("best", 0.0),
-            "count": cam0_result.get("count", 0),
-            "position": cam0.get_estimated_position() if ENABLE_POSITION_TRACKING else 0,
-            "total_cracks": cam0.crack_counter,
-            "stats": cam0_stats
-        }
-    
-    if cam1 is not None and project_config["enable_camera1"]:
-        with cam1.result_lock:
-            cam1_result = dict(cam1.latest_result)
-        with cam1.stats_lock:
-            cam1_stats = dict(cam1.stats)
-        
-        status["cameras"]["camera1"] = {
-            "active": project_config["enable_camera1"],
-            "status": cam1_result.get("status", "unknown"),
-            "crack_detected": cam1_result.get("count", 0) > 0,
-            "confidence": cam1_result.get("best", 0.0),
-            "count": cam1_result.get("count", 0),
-            "position": cam1.get_estimated_position() if ENABLE_POSITION_TRACKING else 0,
-            "total_cracks": cam1.crack_counter,
-            "stats": cam1_stats
-        }
-    
-    return jsonify(status)
+    model_mode_display = "Local YOLO11n (68%)" if MODEL_MODE == "offline" else "Roboflow API"
+    return render_template_string(
+        HTML_TEMPLATE,
+        model_mode=MODEL_MODE,
+        model_mode_display=model_mode_display
+    )
 
 
 @app.route('/api/cracks')
 def get_cracks():
-    """API endpoint to get all detected cracks from both cameras"""
-    all_cracks = []
+    """API endpoint to get all detected cracks"""
+    if cam0 is None:
+        return jsonify({"error": "Camera not initialized"}), 500
     
-    if cam0 is not None:
-        cracks = cam0.get_crack_history()
-        all_cracks.extend(cracks)
-    
-    if cam1 is not None:
-        cracks = cam1.get_crack_history()
-        all_cracks.extend(cracks)
-    
-    # Sort by position
-    all_cracks.sort(key=lambda x: x.get('position_m', 0))
-    
-    current_position = cam0.get_estimated_position() if cam0 else 0
-    
-    with config_lock:
-        robot_velocity = project_config.get("robot_velocity", ROBOT_VELOCITY_MPS)
-        model_id = project_config.get("model_id", CURRENT_MODEL)
+    cracks = cam0.get_crack_history()
+    current_position = cam0.get_estimated_position()
     
     return jsonify({
         "pipeline_length_m": PIPELINE_LENGTH_METERS,
-        "robot_velocity": robot_velocity,
-        "model_id": model_id,
         "current_position_m": current_position,
-        "total_cracks": len(all_cracks),
-        "cracks": all_cracks,
+        "velocity": ROBOT_VELOCITY,
+        "velocity_unit": VELOCITY_UNIT,
+        "total_cracks": len(cracks),
+        "cracks": cracks,
     })
+
+
+@app.route('/generate_report')
+def generate_report():
+    """Generate PDF report of inspection"""
+    try:
+        if cam0 is None:
+            return "Camera not initialized", 500
+        
+        # Collect inspection data
+        cracks = cam0.get_crack_history()
+        elapsed = cam0.get_elapsed_time()
+        
+        # Count by severity
+        critical = sum(1 for c in cracks if c.get('severity') == 'CRITICAL')
+        high = sum(1 for c in cracks if c.get('severity') == 'HIGH')
+        medium = sum(1 for c in cracks if c.get('severity') == 'MEDIUM')
+        low = sum(1 for c in cracks if c.get('severity') == 'LOW')
+        
+        with cam0.stats_lock:
+            total_frames = cam0.stats.get('total_frames', 0)
+        
+        inspection_data = {
+            'date': time.strftime("%Y-%m-%d %H:%M:%S"),
+            'pipeline_length': PIPELINE_LENGTH_METERS,
+            'velocity': ROBOT_VELOCITY,
+            'velocity_unit': VELOCITY_UNIT,
+            'duration': elapsed,
+            'model_mode': MODEL_MODE,
+            'total_frames': total_frames,
+            'total_cracks': len(cracks),
+            'critical_count': critical,
+            'high_count': high,
+            'medium_count': medium,
+            'low_count': low,
+            'cracks': cracks,
+        }
+        
+        # Generate PDF
+        pdf_path = REPORTS_DIR / f"inspection_report_{stamp()}.pdf"
+        success = generate_pdf_report(pdf_path, inspection_data)
+        
+        if success and pdf_path.exists():
+            return send_file(pdf_path, 
+                           mimetype='application/pdf',
+                           as_attachment=True,
+                           download_name='pipeline_inspection_report.pdf')
+        else:
+            return "Error generating PDF report", 500
+            
+    except Exception as e:
+        print(f"[PDF] Error in generate_report: {e}")
+        import traceback
+        traceback.print_exc()
+        return f"Error: {str(e)}", 500
 
 
 @app.route('/crack_image/<int:camera_id>/<int:crack_id>')
@@ -1974,29 +1803,7 @@ def get_crack_image(camera_id, crack_id):
 
 
 def generate_frames(cam_state: CameraState):
-    """Generate frames from camera state, handling None case"""
-    if cam_state is None:
-        # Return placeholder image
-        while True:
-            placeholder = np.zeros((480, 640, 3), dtype=np.uint8)
-            cv2.putText(placeholder, "Camera Not Active", (150, 240), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-            ret, buffer = cv2.imencode('.jpg', placeholder, [cv2.IMWRITE_JPEG_QUALITY, STREAM_JPEG_QUALITY])
-            if ret:
-                frame_bytes = buffer.tobytes()
-                yield (b'--frame\r\n'
-                       b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
-            time.sleep(1)
-    
-    last_frame_time = 0
-    while not cam_state.stop_flag:
-        # Throttle to ~15 FPS for web streaming (smoother than full speed)
-        current_time = time.time()
-        if current_time - last_frame_time < 0.067:  # ~15 FPS
-            time.sleep(0.01)
-            continue
-        last_frame_time = current_time
-        
+    while True:
         with cam_state.annotated_lock:
             frame = cam_state.latest_annotated_frame
         
@@ -2004,8 +1811,7 @@ def generate_frames(cam_state: CameraState):
             time.sleep(0.033)
             continue
         
-        # Use lower quality for faster streaming
-        ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, STREAM_JPEG_QUALITY])
+        ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
         if not ret:
             continue
         
@@ -2024,310 +1830,81 @@ def video_feed(cam_id):
         return "Invalid camera ID", 404
 
 
-# ---------------- PDF EXPORT ----------------
-def generate_inspection_report_pdf(output_path: Path):
-    """Generate comprehensive PDF report of inspection results"""
-    if not REPORTLAB_AVAILABLE:
-        raise ImportError("reportlab not installed. Run: pip install reportlab")
-    
-    # Create PDF document
-    doc = SimpleDocTemplate(str(output_path), pagesize=A4,
-                           rightMargin=30, leftMargin=30,
-                           topMargin=30, bottomMargin=30)
-    
-    story = []
-    styles = getSampleStyleSheet()
-    
-    # Custom styles
-    title_style = ParagraphStyle(
-        'CustomTitle',
-        parent=styles['Heading1'],
-        fontSize=24,
-        textColor=colors.HexColor('#00ff88'),
-        spaceAfter=30,
-        alignment=TA_CENTER
-    )
-    
-    heading_style = ParagraphStyle(
-        'CustomHeading',
-        parent=styles['Heading2'],
-        fontSize=16,
-        textColor=colors.HexColor('#00ff88'),
-        spaceAfter=12,
-        spaceBefore=12
-    )
-    
-    # Title
-    story.append(Paragraph("Pipeline Crack Detection Inspection Report", title_style))
-    story.append(Spacer(1, 20))
-    
-    # Report metadata
-    report_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    story.append(Paragraph(f"<b>Report Generated:</b> {report_time}", styles['Normal']))
-    story.append(Spacer(1, 20))
-    
-    # Project Configuration
-    story.append(Paragraph("Project Configuration", heading_style))
-    with config_lock:
-        config_data = [
-            ["Parameter", "Value"],
-            ["Pipeline Length", f"{project_config.get('pipeline_length', 0):.1f} meters"],
-            ["Robot Velocity", f"{project_config.get('robot_velocity', 0):.3f} m/s"],
-            ["Inspection Duration", f"{project_config.get('inspection_duration', 0):.0f} seconds"],
-            ["Model Used", project_config.get('model_id', 'N/A')],
-            ["Camera 0 Enabled", "Yes" if project_config.get('enable_camera0', False) else "No"],
-            ["Camera 1 Enabled", "Yes" if project_config.get('enable_camera1', False) else "No"],
-        ]
-    
-    config_table = Table(config_data, colWidths=[3*inch, 3*inch])
-    config_table.setStyle(TableStyle([
-        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#00ff88')),
-        ('TEXTCOLOR', (0, 0), (-1, 0), colors.black),
-        ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
-        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-        ('FONTSIZE', (0, 0), (-1, 0), 12),
-        ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
-        ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
-        ('GRID', (0, 0), (-1, -1), 1, colors.black)
-    ]))
-    story.append(config_table)
-    story.append(Spacer(1, 20))
-    
-    # Collect statistics from both cameras
-    total_stats = {
-        'processed_frames': 0,
-        'total_saved': 0,
-        'critical_cracks': 0,
-        'high_cracks': 0,
-        'medium_cracks': 0,
-        'low_cracks': 0,
-        'skipped_blurry': 0,
-        'inference_errors': 0,
-    }
-    
-    for cam in [cam0, cam1]:
-        if cam is not None:
-            with cam.stats_lock:
-                for key in total_stats:
-                    total_stats[key] += cam.stats.get(key, 0)
-    
-    # Overall Statistics
-    story.append(Paragraph("Overall Statistics", heading_style))
-    stats_data = [
-        ["Metric", "Count"],
-        ["Total Frames Processed", str(total_stats['processed_frames'])],
-        ["Detections Saved", str(total_stats['total_saved'])],
-        ["Critical Severity Cracks", str(total_stats['critical_cracks'])],
-        ["High Severity Cracks", str(total_stats['high_cracks'])],
-        ["Medium Severity Cracks", str(total_stats['medium_cracks'])],
-        ["Low Severity Cracks", str(total_stats['low_cracks'])],
-        ["Blurry Frames Skipped", str(total_stats['skipped_blurry'])],
-        ["Inference Errors", str(total_stats['inference_errors'])],
-    ]
-    
-    stats_table = Table(stats_data, colWidths=[3*inch, 3*inch])
-    stats_table.setStyle(TableStyle([
-        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#00ff88')),
-        ('TEXTCOLOR', (0, 0), (-1, 0), colors.black),
-        ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
-        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-        ('FONTSIZE', (0, 0), (-1, 0), 12),
-        ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
-        ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
-        ('GRID', (0, 0), (-1, -1), 1, colors.black)
-    ]))
-    story.append(stats_table)
-    story.append(Spacer(1, 20))
-    
-    # Crack Detection Details
-    story.append(Paragraph("Detailed Crack Detections", heading_style))
-    
-    # Collect all detection JSON files
-    detection_files = []
-    for found_dir in [FOUND_DIR_CAM0, FOUND_DIR_CAM1]:
-        if found_dir.exists():
-            detection_files.extend(sorted(found_dir.glob("*.json"), key=lambda p: p.stat().st_mtime))
-    
-    if detection_files:
-        for i, json_file in enumerate(detection_files[:50]):  # Limit to 50 most recent
-            try:
-                with open(json_file, 'r') as f:
-                    data = json.load(f)
-                
-                timestamp = datetime.fromtimestamp(data.get('timestamp', 0)).strftime("%Y-%m-%d %H:%M:%S")
-                detections = data.get('detections', 0)
-                confidence = data.get('max_confidence', 0)
-                severities = ', '.join(data.get('severities', []))
-                classes = ', '.join(data.get('classes', []))
-                position = data.get('position', 0)
-                image_path = data.get('image_path', '')
-                
-                story.append(Paragraph(f"<b>Detection {i+1}:</b> {timestamp}", styles['Normal']))
-                detection_data = [
-                    ["Position", f"{position:.2f}m"],
-                    ["Confidence", f"{confidence:.3f}"],
-                    ["Severity", severities],
-                    ["Classes", classes],
-                    ["Count", str(detections)],
-                ]
-                
-                det_table = Table(detection_data, colWidths=[2*inch, 4*inch])
-                det_table.setStyle(TableStyle([
-                    ('BACKGROUND', (0, 0), (0, -1), colors.lightgrey),
-                    ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
-                    ('FONTSIZE', (0, 0), (-1, -1), 9),
-                    ('GRID', (0, 0), (-1, -1), 0.5, colors.grey)
-                ]))
-                story.append(det_table)
-                story.append(Spacer(1, 10))
-                
-                # Add crack image if available
-                if image_path and Path(image_path).exists():
-                    try:
-                        img_path = Path(image_path)
-                        # Use annotated image for PDF (shows bounding boxes)
-                        img = RLImage(str(img_path), width=5*inch, height=3.75*inch)
-                        story.append(img)
-                        story.append(Spacer(1, 5))
-                    except Exception as img_err:
-                        print(f"Error adding image {image_path}: {img_err}")
-                        story.append(Paragraph(f"<i>Image not available: {img_path.name}</i>", styles['Normal']))
-                        story.append(Spacer(1, 5))
-                else:
-                    story.append(Paragraph("<i>No image available for this detection</i>", styles['Normal']))
-                    story.append(Spacer(1, 5))
-                
-                # Add page break every 3 detections (reduced because of images)
-                if (i + 1) % 3 == 0:
-                    story.append(PageBreak())
-                    
-            except Exception as e:
-                print(f"Error reading {json_file}: {e}")
-                continue
-    else:
-        story.append(Paragraph("No crack detections recorded.", styles['Normal']))
-        story.append(Spacer(1, 20))
-    
-    # Build PDF
-    doc.build(story)
-    return output_path
-
-
-@app.route('/api/export_pdf', methods=['GET'])
-def export_pdf():
-    """Export inspection results to PDF"""
-    if not REPORTLAB_AVAILABLE:
-        return jsonify({"error": "PDF export not available. Install reportlab: pip install reportlab"}), 500
-    
-    try:
-        # Generate timestamp for filename
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"inspection_report_{timestamp}.pdf"
-        output_path = REPORTS_DIR / filename
-        
-        # Generate PDF
-        generate_inspection_report_pdf(output_path)
-        
-        # Send file
-        return send_file(
-            str(output_path),
-            mimetype='application/pdf',
-            as_attachment=True,
-            download_name=filename
-        )
-    except Exception as e:
-        return jsonify({"error": f"PDF generation failed: {str(e)}"}), 500
-
-
 # ---------------- MAIN ----------------
 def main():
     global cam0, cam1
     
-    print("=" * 70)
-    print("  Pi 5 Dual CSI Camera Crack Detection System (WEB CONTROL)")
-    print("=" * 70)
+    print("=" * 60)
+    print("  Pi 5 SINGLE CSI Camera Crack Detection (WEB STREAMING)")
+    print("=" * 60)
+    print(f"  Camera 0 rpicam id : {CAMERA_0_ID}")
+    print(f"  Camera 1           : DISABLED (not connected)")
     print(f"  Flask web server   : http://0.0.0.0:{FLASK_PORT}")
     print(f"  Access from browser: http://<pi-ip>:{FLASK_PORT}")
-    print(f"  Camera 0 ID        : {CAMERA_0_ID}")
-    print(f"  Camera 1 ID        : {CAMERA_1_ID}")
-    print("\n  📋 SETUP INSTRUCTIONS:")
-    print("  1. Open the web interface in your browser")
-    print("  2. Configure pipeline parameters")
-    print("  3. Select which cameras to use")
-    print("  4. Click 'Start Inspection System'")
-    print("  5. Monitor and control from the dashboard")
     
     if ENABLE_POSITION_TRACKING:
-        print("\n  📍 PIPELINE LOCALIZATION ENABLED")
-        print(f"  Default Pipeline Length:   {PIPELINE_LENGTH_METERS:.1f}m")
-        print(f"  Default Est. Duration:     {ESTIMATED_INSPECTION_DURATION_SEC:.0f}s ({ESTIMATED_INSPECTION_DURATION_SEC/60:.1f} min)")
-        print("  Position tracking based on elapsed time (approximate)")
+        print("\n  PIPELINE LOCALIZATION ENABLED")
+        print(f"  Pipeline Length:   {PIPELINE_LENGTH_METERS:.1f}m")
+        print(f"  Est. Duration:     {ESTIMATED_INSPECTION_DURATION_SEC:.0f}s ({ESTIMATED_INSPECTION_DURATION_SEC/60:.1f} min)")
+        print(f"  Position Estimate: Based on elapsed time (approx. constant speed)")
+        print("  IMPORTANT: This is an APPROXIMATE estimate, not precise odometry!")
     
-    print("=" * 70)
-    print("\nPress Ctrl+C to stop.\n")
+    print("=" * 60)
+    print("Press Ctrl+C to stop.\n")
 
-    # Start Flask web server - cameras will be started via web interface
+    cam0 = CameraState(0, FOUND_DIR_CAM0, REALTIME_FOUND_DIR_CAM0)
+    cam1 = CameraState(1, FOUND_DIR_CAM1, REALTIME_FOUND_DIR_CAM1)  # Dummy, not used
+
+    # Only start Camera 0 threads
+    t_cap0 = threading.Thread(target=camera_capture_thread, args=(cam0, CAMERA_0_ID), daemon=True)
+    t_inf0 = threading.Thread(target=inference_loop, args=(cam0,), daemon=True)
+    t_dash = threading.Thread(target=dashboard_thread, args=([cam0],), daemon=True)  # Only cam0 in dashboard
+
+    t_cap0.start()
+    t_inf0.start()
+    t_dash.start()
+
     try:
         app.run(host=FLASK_HOST, port=FLASK_PORT, debug=False, threaded=True)
     except KeyboardInterrupt:
         pass
     finally:
         print("\nStopping...")
-        
-        # Stop and close all cameras if they were started
-        if cam0 is not None:
-            cam0.stop_flag = True
-            cam0.close_csv()
-        if cam1 is not None:
-            cam1.stop_flag = True
-            cam1.close_csv()
-        
+        cam0.stop_flag = True
         time.sleep(0.5)
-
-        print("\n" + "=" * 70)
-        print("  FINAL STATS - PIPELINE INSPECTION")
-        print("=" * 70)
         
-        # Show camera 0 stats if it was initialized
-        if cam0 is not None and ENABLE_POSITION_TRACKING:
+        # Close CSV files
+        cam0.close_csv()
+
+        print("\n" + "=" * 60)
+        print("  FINAL STATS - PIPELINE INSPECTION")
+        print("=" * 60)
+        
+        if ENABLE_POSITION_TRACKING:
             elapsed = cam0.get_elapsed_time()
             final_position = cam0.get_estimated_position()
             print(f"\n  Pipeline Length:   {PIPELINE_LENGTH_METERS:.1f}m")
             print(f"  Inspection Time:   {elapsed:.1f}s ({elapsed/60:.1f} min)")
             print(f"  Final Position:    {final_position:.2f}m")
-            print(f"  Camera 0 Cracks:   {cam0.crack_counter}")
-            if cam1 is not None:
-                print(f"  Camera 1 Cracks:   {cam1.crack_counter}")
-                print(f"  Total Cracks:      {cam0.crack_counter + cam1.crack_counter}")
+            print(f"  Total Cracks:      {cam0.crack_counter}")
         
-        if cam0 is not None:
-            with cam0.stats_lock:
-                s = dict(cam0.stats)
-            print(f"\n  Camera 0:")
-            print(f"    Total Frames:      {s['total_frames']}")
-            print(f"    Processed:         {s['processed_frames']}")
-            print(f"    Saved:             {s['total_saved']}")
-            print(f"    Errors:            {s['inference_errors']}")
-            print(f"    Severity: Critical={s['critical_cracks']} High={s['high_cracks']} "
-                  f"Medium={s['medium_cracks']} Low={s['low_cracks']}")
+        with cam0.stats_lock:
+            s = dict(cam0.stats)
+        print(f"\n  Camera 0:")
+        print(f"    Total Frames:      {s['total_frames']}")
+        print(f"    Processed:         {s['processed_frames']}")
+        print(f"    Saved:             {s['total_saved']}")
+        print(f"    Errors:            {s['inference_errors']}")
+        print(f"    Severity: Critical={s['critical_cracks']} High={s['high_cracks']} "\
+              f"Medium={s['medium_cracks']} Low={s['low_cracks']}")
         
-        if cam1 is not None:
-            with cam1.stats_lock:
-                s = dict(cam1.stats)
-            print(f"\n  Camera 1:")
-            print(f"    Total Frames:      {s['total_frames']}")
-            print(f"    Processed:         {s['processed_frames']}")
-            print(f"    Saved:             {s['total_saved']}")
-            print(f"    Errors:            {s['inference_errors']}")
-            print(f"    Severity: Critical={s['critical_cracks']} High={s['high_cracks']} "
-                  f"Medium={s['medium_cracks']} Low={s['low_cracks']}")
+        if ENABLE_POSITION_TRACKING:
+            print(f"\n  CSV Report: {REPORTS_DIR}/cam0_crack_report_*.csv")
         
-        if ENABLE_POSITION_TRACKING and cam0 is not None:
-            print(f"\n  CSV Reports: {REPORTS_DIR}/")
-        
-        print("\n" + "=" * 70)
+        print("\n" + "=" * 60)
         print("Done.")
 
 
 if __name__ == "__main__":
     main()
+
