@@ -1,0 +1,96 @@
+# =============================================================================
+# Dockerfile for Raspberry Pi 5 — Dual CSI Camera Crack Detection
+# Target: Raspberry Pi 5 (64-bit ARM, aarch64)
+# Script: realtime_pi5_dual_web.py
+# Web UI: http://<pi-ip>:5000
+#
+# Build:
+#   docker build -f Dockerfile.pi5 -t crack-app-pi5 .
+#
+# Run:
+#   docker run -it --rm \
+#     --privileged \
+#     --device /dev/video0 \
+#     --device /dev/video1 \
+#     -v /run/udev:/run/udev:ro \
+#     -v $(pwd)/data:/app/data \
+#     -p 5000:5000 \
+#     --env-file .env \
+#     crack-app-pi5
+# =============================================================================
+
+FROM --platform=linux/arm64 python:3.11-slim-bookworm
+
+LABEL maintainer="Shayan Naghashpour"
+LABEL description="Pi 5 Dual CSI Camera Real-time Crack Detection"
+
+# ── System dependencies ──────────────────────────────────────────────────────
+# libcamera-apps  → rpicam-vid (used by pi5 script via subprocess)
+# libgl1 + libglib2.0  → OpenCV headless rendering
+# libgomp1        → OpenMP threading (used by numpy/torch)
+# v4l-utils       → video4linux camera utilities
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    # Camera capture (rpicam-vid)
+    libcamera-apps \
+    libcamera0 \
+    v4l-utils \
+    # OpenCV system libs
+    libgl1-mesa-glx \
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender1 \
+    libgomp1 \
+    # PDF generation (reportlab)
+    libfreetype6 \
+    # General utilities
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── Working directory ─────────────────────────────────────────────────────────
+WORKDIR /app
+
+# ── Python dependencies ───────────────────────────────────────────────────────
+# Copy requirements first for layer caching
+COPY requirements.txt .
+
+# Install CPU-only torch build (lighter, suitable for Pi 5)
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir \
+        torch \
+        torchvision \
+        --index-url https://download.pytorch.org/whl/cpu
+
+# Install remaining Python packages
+RUN pip install --no-cache-dir \
+    opencv-python-headless>=4.8.0 \
+    python-dotenv>=1.0.0 \
+    numpy>=1.24.0 \
+    requests>=2.31.0 \
+    flask>=3.0.0 \
+    reportlab>=4.0.0 \
+    pillow>=10.0.0 \
+    ultralytics>=8.0.0 \
+    inference-sdk>=0.9.0
+
+# ── Application files ─────────────────────────────────────────────────────────
+COPY realtime_pi5_dual_web.py .
+COPY models/ models/
+
+# Copy example env if no .env is mounted at runtime
+COPY .env.example .env.example
+
+# Output directory (mount a host volume here to persist reports)
+RUN mkdir -p data/realtime_results/reports
+
+# ── Expose Flask port ─────────────────────────────────────────────────────────
+EXPOSE 5000
+
+# ── Runtime environment ───────────────────────────────────────────────────────
+ENV FLASK_HOST=0.0.0.0 \
+    FLASK_PORT=5000 \
+    MODEL_MODE=offline \
+    PYTHONUNBUFFERED=1
+
+# ── Entrypoint ────────────────────────────────────────────────────────────────
+CMD ["python", "realtime_pi5_dual_web.py"]

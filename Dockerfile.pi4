@@ -1,0 +1,104 @@
+# =============================================================================
+# Dockerfile for Raspberry Pi 4 — Optimized Single/Dual Camera Crack Detection
+# Target: Raspberry Pi 4 (64-bit ARM, aarch64) running Raspberry Pi OS (64-bit)
+# Script: realtime_pi4_optimized_web.py
+# Web UI: http://<pi-ip>:5000
+#
+# Build:
+#   docker build -f Dockerfile.pi4 -t crack-app-pi4 .
+#
+# Run:
+#   docker run -it --rm \
+#     --privileged \
+#     --device /dev/video0 \
+#     -v /run/udev:/run/udev:ro \
+#     -v /dev/bus/usb:/dev/bus/usb \
+#     -v $(pwd)/data:/app/data \
+#     -p 5000:5000 \
+#     --env-file .env \
+#     crack-app-pi4
+#
+# NOTE: For CSI camera (picamera2), pass --device /dev/video0 and ensure
+#       the host has libcamera and the Pi camera stack enabled in /boot/config.txt
+# =============================================================================
+
+FROM --platform=linux/arm64 python:3.11-slim-bookworm
+
+LABEL maintainer="Shayan Naghashpour"
+LABEL description="Pi 4 Optimised Single/Dual Camera Real-time Crack Detection"
+
+# ── System dependencies ──────────────────────────────────────────────────────
+# python3-picamera2 + libcamera  → CSI camera stack for Pi 4
+# libgl1 + libglib2.0            → OpenCV headless rendering
+# libgomp1                       → OpenMP threading (numpy/torch)
+# v4l-utils                      → video4linux camera utilities
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    # picamera2 / libcamera dependencies
+    python3-picamera2 \
+    python3-libcamera \
+    libcamera0 \
+    libcamera-apps \
+    v4l-utils \
+    # OpenCV system libs
+    libgl1-mesa-glx \
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender1 \
+    libgomp1 \
+    # PDF generation (reportlab)
+    libfreetype6 \
+    # General utilities
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── Working directory ─────────────────────────────────────────────────────────
+WORKDIR /app
+
+# ── Python dependencies ───────────────────────────────────────────────────────
+COPY requirements.txt .
+
+# Install CPU-only torch build (Pi 4 has no GPU; keep image smaller)
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir \
+        torch \
+        torchvision \
+        --index-url https://download.pytorch.org/whl/cpu
+
+# Install remaining Python packages
+# NOTE: picamera2 is installed from system packages above (python3-picamera2),
+#       so we link it into the container's site-packages via --system-site-packages
+#       or install the pip version as a fallback.
+RUN pip install --no-cache-dir \
+    opencv-python-headless>=4.8.0 \
+    python-dotenv>=1.0.0 \
+    numpy>=1.24.0 \
+    requests>=2.31.0 \
+    flask>=3.0.0 \
+    reportlab>=4.0.0 \
+    pillow>=10.0.0 \
+    ultralytics>=8.0.0 \
+    picamera2
+
+# ── Application files ─────────────────────────────────────────────────────────
+COPY realtime_pi4_optimized_web.py .
+COPY models/ models/
+
+# Copy example env if no .env is mounted at runtime
+COPY .env.example .env.example
+
+# Output directory (mount a host volume here to persist reports)
+RUN mkdir -p data/realtime_results/reports
+
+# ── Expose Flask port ─────────────────────────────────────────────────────────
+EXPOSE 5000
+
+# ── Runtime environment ───────────────────────────────────────────────────────
+ENV FLASK_HOST=0.0.0.0 \
+    FLASK_PORT=5000 \
+    MODEL_MODE=offline \
+    LOCAL_MODEL_PATH=models/best.pt \
+    PYTHONUNBUFFERED=1
+
+# ── Entrypoint ────────────────────────────────────────────────────────────────
+CMD ["python", "realtime_pi4_optimized_web.py"]
