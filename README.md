@@ -4,533 +4,373 @@
 
 **AI-Powered Real-Time Crack Detection for Industrial Pipeline Inspection**
 
-[![Python](https://img.shields.io/badge/Python-3.9+-blue.svg)](https://www.python.org/downloads/)
+[![Python](https://img.shields.io/badge/Python-3.11-blue.svg)](https://www.python.org/downloads/)
 [![YOLOv11](https://img.shields.io/badge/YOLOv11n-68%25%20mAP-green.svg)](https://github.com/ultralytics/ultralytics)
-[![Raspberry Pi](https://img.shields.io/badge/Raspberry%20Pi-5-red.svg)](https://www.raspberrypi.com/)
+[![Raspberry Pi](https://img.shields.io/badge/Raspberry%20Pi-4%20%7C%205-red.svg)](https://www.raspberrypi.com/)
 [![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 </div>
 
 ---
 
-## 🎯 Overview
+## Overview
 
-The **Automated Pipeline Inspection System** is an advanced industrial solution for real-time detection and monitoring of pipeline defects using dual-camera configuration and AI-powered computer vision. The system provides both edge computing (on-device) and cloud-based detection modes for maximum flexibility.
+The **Automated Pipeline Inspection System** is a final year engineering project developed at the University of Nicosia (2026). It provides real-time detection and classification of structural defects in industrial pipelines using a dual-camera configuration mounted on an inspection robot.
 
-### Key Capabilities
-- ✅ **Dual AI Models**: On-Device YOLOv11n (68% mAP) + Cloud-Based Roboflow API
-- ✅ **Real-Time Processing**: Live video streaming with annotated detection overlay
-- ✅ **Dual Camera Support**: Simultaneous monitoring from two CSI cameras (Raspberry Pi 5)
-- ✅ **Velocity-Based Positioning**: Physics-based crack location tracking (m/s or km/h)
-- ✅ **Web Interface**: Browser-based monitoring dashboard at port 5000
-- ✅ **PDF Report Generation**: Professional inspection reports with severity analysis
-- ✅ **Edge Computing**: Runs offline on Raspberry Pi 5 without internet
-- ✅ **Interactive Configuration**: Operator-friendly startup prompts
-- ✅ **Production Ready**: Docker support, comprehensive logging, error handling
+The system supports two inference modes — on-device AI (YOLOv11n) for edge computing without internet access, and a cloud-based Roboflow API for server-side processing. A live web dashboard streams annotated video feeds and generates PDF inspection reports with position-tagged defects.
+
+Two hardware-specific implementations are provided:
+
+- **`realtime_pi5_dual_web.py`** — Raspberry Pi 5, dual CSI cameras via `rpicam-vid`
+- **`realtime_pi4_optimized_web.py`** — Raspberry Pi 4, single/dual CSI cameras via `picamera2` with `cv2.VideoCapture` fallback
 
 ---
 
-## 🏗️ System Architecture
+## System Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    OPERATOR INTERFACE                        │
-│  (Pipeline Length, Velocity, Model Selection)                │
-└───────────────────┬─────────────────────────────────────────┘
-                    │
-┌───────────────────▼─────────────────────────────────────────┐
-│              AUTOMATED INSPECTION SYSTEM                     │
-│  ┌─────────────────────────────────────────────────────┐    │
-│  │  Raspberry Pi 5 (8GB RAM)                            │    │
-│  │  ┌─────────────┐         ┌─────────────┐            │    │
-│  │  │  CSI CAM0   │         │  CSI CAM1   │            │    │
-│  │  │ (1080p 30fps)         │ (1080p 30fps)            │    │
-│  │  └──────┬──────┘         └──────┬──────┘            │    │
-│  │         │                       │                    │    │
-│  │         └───────┬───────────────┘                    │    │
-│  │                 │                                    │    │
-│  │         ┌───────▼─────────┐                          │    │
-│  │         │ Image Processing │                          │    │
-│  │         │   (OpenCV)       │                          │    │
-│  │         └───────┬─────────┘                          │    │
-│  │                 │                                    │    │
-│  │         ┌───────▼─────────┐                          │    │
-│  │         │  AI Detection    │                          │    │
-│  │         │  ┌────────────┐  │                          │    │
-│  │         │  │ YOLOv11n   │  │ (On-Device)             │    │
-│  │         │  │ 68% mAP    │  │                          │    │
-│  │         │  └────────────┘  │                          │    │
-│  │         │  ┌────────────┐  │                          │    │
-│  │         │  │ Roboflow   │  │ (Cloud API)             │    │
-│  │         │  │    API     │  │                          │    │
-│  │         │  └────────────┘  │                          │    │
-│  │         └───────┬─────────┘                          │    │
-│  │                 │                                    │    │
-│  │         ┌───────▼─────────┐                          │    │
-│  │         │ Flask Web Server │                          │    │
-│  │         │   (Port 5000)    │                          │    │
-│  │         └───────┬─────────┘                          │    │
-│  └─────────────────┼─────────────────────────────────────┘    │
-└────────────────────┼─────────────────────────────────────────┘
-                     │
-         ┌───────────▼────────────┐
-         │  Web Browser Dashboard  │
-         │  • Live Video Streams   │
-         │  • Detection Statistics │
-         │  • Position Tracking    │
-         │  • PDF Report Export    │
-         └────────────────────────┘
++-------------------------------------------------------------+
+|                    OPERATOR INTERFACE                        |
+|  (Pipeline Length, Robot Velocity, Model Selection)         |
++---------------------------+---------------------------------+
+                            |
++---------------------------v---------------------------------+
+|              AUTOMATED INSPECTION SYSTEM                    |
+|                                                             |
+|  +-------------------------------------------------------+  |
+|  |  Raspberry Pi 4 / 5                                   |  |
+|  |                                                       |  |
+|  |  [ CSI Camera 0 ]         [ CSI Camera 1 ]           |  |
+|  |  (1080p, 30 fps)          (1080p, 30 fps)            |  |
+|  |         |                        |                   |  |
+|  |         +----------+-------------+                   |  |
+|  |                    |                                 |  |
+|  |          [ Image Pre-processing ]                    |  |
+|  |              (OpenCV)                                |  |
+|  |                    |                                 |  |
+|  |          [ AI Defect Detection ]                     |  |
+|  |          +------------------+                        |  |
+|  |          | YOLOv11n (Local) |  On-Device Mode        |  |
+|  |          +------------------+                        |  |
+|  |          +------------------+                        |  |
+|  |          | Roboflow API     |  Cloud Mode            |  |
+|  |          +------------------+                        |  |
+|  |                    |                                 |  |
+|  |          [ Flask Web Server - Port 5000 ]            |  |
+|  +-------------------------------------------------------+  |
++---------------------------+---------------------------------+
+                            |
+              +-------------v--------------+
+              |     Web Browser Dashboard  |
+              |  - Live annotated streams  |
+              |  - Detection statistics    |
+              |  - Position tracking       |
+              |  - PDF report export       |
+              +----------------------------+
 ```
 
 ---
 
-## 🚀 Quick Start
+## Hardware Requirements
 
-### For Raspberry Pi 5 (Production)
+### Raspberry Pi 5 (Primary Target)
 
-1. **Clone the repository**
+| Component     | Specification                               |
+|---------------|---------------------------------------------|
+| Model         | Raspberry Pi 5 (4 GB or 8 GB RAM)           |
+| Cameras       | 2x CSI Camera Modules (15-pin ribbon cable) |
+| Storage       | 32 GB+ microSD (Class 10 or faster)         |
+| Power Supply  | 5 V / 5 A USB-C                             |
+| Cooling       | Active cooling recommended                  |
+| OS            | Raspberry Pi OS 64-bit (Bookworm)           |
+
+### Raspberry Pi 4 (Supported)
+
+| Component     | Specification                               |
+|---------------|---------------------------------------------|
+| Model         | Raspberry Pi 4 Model B (2 GB RAM minimum)  |
+| Cameras       | 1x or 2x CSI Camera Modules                |
+| Storage       | 32 GB+ microSD (Class 10 or faster)        |
+| Power Supply  | 5 V / 3 A USB-C                            |
+| OS            | Raspberry Pi OS 64-bit (Bullseye/Bookworm) |
+
+---
+
+## Installation
+
+### 1. Clone the Repository
+
 ```bash
-cd ~/Desktop
-git clone <repository-url> Crack_App
+git clone https://github.com/callmeshayan/Crack_App.git
 cd Crack_App
 ```
 
-2. **Create virtual environment**
+### 2. Create a Virtual Environment
+
 ```bash
-python3 -m venv venv
-source venv/bin/activate
+python3.11 -m venv .venv
+source .venv/bin/activate
 ```
 
-3. **Install dependencies**
+### 3. Install Python Dependencies
+
 ```bash
+pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-4. **Configure environment**
+### 4. Configure Environment Variables
+
 ```bash
 cp .env.example .env
-nano .env  # Edit with your settings
+nano .env
 ```
 
-5. **Deploy AI model** (for offline mode)
-```bash
-# Copy your trained model to models/ directory
-cp /path/to/your/best.pt models/best.pt
-```
-
-6. **Run the system**
-```bash
-python realtime_pi5_dual_web.py
-```
-
-7. **Access web interface**
-   - Open browser: `http://raspberrypi-ip:5000`
-   - Or locally: `http://localhost:5000`
-
-### For Development (Mac/Linux)
+### 5. Place the Trained Model
 
 ```bash
-# Clone and setup
-git clone <repository-url> crack_app
-cd crack_app
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-
-# Configure
-cp .env.example .env
-
-# Run with test images (no camera required)
-python realtime_pi5_dual_web.py
-```
-
-### Using Docker
-
-```bash
-# Build image
-docker build -t pipeline-inspection .
-
-# Run container
-./run_docker.sh
+# Ensure the YOLOv11n model is present for offline mode
+ls models/best.pt
 ```
 
 ---
 
-## 📋 Configuration
+## Configuration
 
 ### Interactive Startup
-When you run the system, you'll be prompted to configure:
 
-1. **Detection Model Selection**
-   - Option 1: On-Device AI Model (YOLOv11n - 68% mAP, Edge Computing)
-   - Option 2: Cloud-Based AI Model (Roboflow API - Real-time Processing)
+On launch, the system prompts the operator for the following parameters:
 
-2. **Pipeline Length** (meters)
-   - Total length of the pipeline to inspect
+1. **Detection Model** — On-device (YOLOv11n) or cloud-based (Roboflow API)
+2. **Pipeline Length** — Total length of the pipeline under inspection (m / km / cm)
+3. **Robot Velocity** — Speed of the inspection robot (m/s, km/h, or mm/s)
 
-3. **Robot Velocity** (m/s or km/h)
-   - Speed of the inspection robot/camera
+### Environment Variables
 
-### Environment Variables (.env)
+All parameters can also be pre-configured via the `.env` file:
 
 ```bash
-# Model Configuration
-MODEL_MODE=offline              # offline (YOLOv11n) or online (Roboflow)
-LOCAL_MODEL_PATH=models/best.pt # Path to YOLO model
-YOLO_DEVICE=cpu                 # cpu, mps, or cuda
+# Inference mode: offline (YOLOv11n) or online (Roboflow)
+MODEL_MODE=offline
 
-# Roboflow API (for online mode)
-RF_API_KEY=your_api_key
-RF_WORKSPACE=your_workspace
+# Local model path (offline mode)
+LOCAL_MODEL_PATH=models/best.pt
+
+# Inference device: cpu, mps (Apple Silicon), or cuda
+YOLO_DEVICE=cpu
+
+# Roboflow credentials (online mode only)
+RF_API_KEY=your_api_key_here
+RF_WORKSPACE=your_workspace_slug
 RF_WORKFLOW_ID=your_workflow_id
 
-# Inspection Parameters
-ROBOT_VELOCITY=0.5              # Robot speed
-VELOCITY_UNIT=m/s               # m/s or km/h
-PIPELINE_LENGTH=100.0           # Pipeline length in meters
+# Inspection parameters
+PIPELINE_LENGTH=100.0
+ROBOT_VELOCITY=0.5
+VELOCITY_UNIT=m/s
 
-# Camera Settings
-CAM0_INDEX=0                    # Primary camera
-CAM1_INDEX=1                    # Secondary camera
+# Camera indices
+CAM0_INDEX=0
+CAM1_INDEX=1
 FRAME_WIDTH=1920
 FRAME_HEIGHT=1080
 
-# Web Server
+# Flask web server
 FLASK_PORT=5000
 FLASK_DEBUG=False
 ```
 
 ---
 
-## 🎮 Features in Detail
+## Running the System
 
-### 1. Dual AI Detection Modes
-
-#### On-Device AI (YOLOv11n)
-- **Offline Operation**: No internet required
-- **Performance**: 68% mAP (mean Average Precision)
-- **Speed**: Real-time inference on Raspberry Pi 5
-- **Hardware Support**: CPU, Apple Silicon (MPS), CUDA GPU
-- **Model Size**: ~5.5 MB
-
-#### Cloud-Based AI (Roboflow API)
-- **Online Service**: Requires internet connection
-- **Scalability**: Server-side processing
-- **Flexibility**: Easy model updates without device access
-- **API Rate Limits**: Check Roboflow pricing
-
-### 2. Real-Time Web Dashboard
-
-Access at `http://raspberrypi-ip:5000`
-
-**Features:**
-- Live video streams from both cameras
-- Real-time detection annotations
-- Current position tracking along pipeline
-- Crack detection statistics
-- Severity distribution charts
-- Inspection timeline
-- PDF report generation button
-
-### 3. Position Tracking System
-
-**Physics-Based Calculation:**
-```
-Position (m) = Velocity (m/s) × Time Elapsed (s)
-Progress (%) = (Current Position / Total Length) × 100
-```
-
-**Visual Indicators:**
-- Position overlay on saved crack images
-- Progress bar showing pipeline coverage
-- Distance remaining calculation
-- Estimated completion time
-
-### 4. PDF Report Generation
-
-**Automated Reports Include:**
-- Inspection summary and parameters
-- Total cracks detected by severity
-- Detailed crack list with timestamps
-- Position information for each defect
-- System configuration details
-- Professional formatting with charts
-
-**Generate Reports:**
-- Via web dashboard: Click "Generate PDF Report"
-- REST API: `GET /generate_report`
-
----
-
-## 📁 Project Structure
-
-```
-crack_app/
-├── realtime_pi5_dual_web.py   # Main application (Raspberry Pi 5)
-├── requirements.txt            # Python dependencies
-├── .env.example               # Environment configuration template
-├── Dockerfile                 # Container configuration
-├── run_docker.sh             # Docker run script
-│
-├── models/                    # AI model files
-│   └── best.pt               # YOLOv11n trained model
-│
-├── templates/                 # Web interface templates
-│   └── (Flask HTML templates)
-│
-├── data/                      # Runtime data
-│   ├── inspection_log.csv    # Detection logs
-│   └── crack_images/         # Saved crack images
-│
-├── outputs_batch/            # Batch processing results
-├── images_batch/             # Batch input images
-│
-├── Documentation/
-│   ├── DEPLOY_MODEL.md       # Model deployment guide
-│   ├── OPERATOR_GUIDE.md     # User manual
-│   ├── ARCHITECTURE_DIAGRAM.txt
-│   ├── INTEGRATION_SUMMARY.md
-│   ├── MODEL_MODE_REFERENCE.md
-│   └── OFFLINE_MODEL_SETUP.md
-│
-└── Utilities/
-    ├── gui_app.py            # Desktop GUI application
-    ├── batch_infer_workflow.py
-    ├── infer_image.py        # Single image testing
-    ├── test_offline_mode.py  # Model testing
-    └── smoke_test.py         # System validation
-```
-
----
-
-## 🔧 Hardware Requirements
-
-### Raspberry Pi 5 (Recommended)
-
-| Component | Specification |
-|-----------|--------------|
-| **Model** | Raspberry Pi 5 (4GB or 8GB RAM) |
-| **Cameras** | 2× CSI Camera Modules (15-pin ribbon) |
-| **Storage** | 32GB+ microSD (Class 10 or better) |
-| **Power** | 5V 5A USB-C Power Supply |
-| **Cooling** | Active cooling fan (recommended) |
-| **OS** | Raspberry Pi OS (64-bit) Bookworm |
-
-### Development Machine
-
-| Component | Requirement |
-|-----------|------------|
-| **OS** | macOS, Linux, or Windows |
-| **Python** | 3.9 - 3.13 |
-| **RAM** | 8GB+ |
-| **Storage** | 10GB+ free space |
-
----
-
-## 🎓 Usage Examples
-
-### Example 1: Basic Inspection
+### Raspberry Pi 5
 
 ```bash
-# Start system
 python realtime_pi5_dual_web.py
-
-# Follow prompts:
-# Select Model: 1 (On-Device AI)
-# Pipeline Length: 50 meters
-# Velocity: 0.5 m/s
-
-# Access dashboard
-# Open browser: http://192.168.1.100:5000
 ```
 
-### Example 2: High-Speed Cloud Processing
+### Raspberry Pi 4
 
 ```bash
-# Configure for cloud mode
-export MODEL_MODE=online
-
-# Start system
-python realtime_pi5_dual_web.py
-
-# Select Model: 2 (Cloud-Based AI)
-# Pipeline Length: 200 meters
-# Velocity: 2.5 km/h
+python realtime_pi4_optimized_web.py
 ```
 
-### Example 3: Batch Image Processing
+### Accessing the Web Dashboard
 
-```bash
-# Process existing images
-python batch_infer_workflow.py
+Once running, open a browser and navigate to:
 
-# Results saved in outputs_batch/
 ```
-
-### Example 4: Single Image Testing
-
-```bash
-# Test model on single image
-python infer_image.py test_cam0.jpg
-
-# View annotated result
+http://<device-ip>:5000
 ```
 
 ---
 
-## 🌐 API Endpoints
+## Docker Deployment
 
-### Web Dashboard
-- `GET /` - Main dashboard page
+Separate Docker images are provided for each hardware target.
 
-### Detection Data
-- `GET /api/cracks` - JSON list of all detected cracks
+### Raspberry Pi 5
 
-### Video Streams
-- `GET /video_feed/0` - CAM0 live stream (MJPEG)
-- `GET /video_feed/1` - CAM1 live stream (MJPEG)
+```bash
+# Build
+docker build -f Dockerfile.pi5 -t crack-app-pi5 .
 
-### Reports
-- `GET /generate_report` - Generate and download PDF report
+# Run
+docker run -it --rm \
+  --privileged \
+  --device /dev/video0 \
+  --device /dev/video1 \
+  -v /run/udev:/run/udev:ro \
+  -v $(pwd)/data:/app/data \
+  -p 5000:5000 \
+  --env-file .env \
+  crack-app-pi5
+```
 
-### Images
-- `GET /crack_image/<id>` - Retrieve saved crack image by ID
+### Raspberry Pi 4
+
+```bash
+# Build
+docker build -f Dockerfile.pi4 -t crack-app-pi4 .
+
+# Run
+docker run -it --rm \
+  --privileged \
+  --device /dev/video0 \
+  -v /run/udev:/run/udev:ro \
+  -v $(pwd)/data:/app/data \
+  -p 5000:5000 \
+  --env-file .env \
+  crack-app-pi4
+```
 
 ---
 
-## 🐛 Troubleshooting
+## Web Dashboard and API
 
-### Camera Issues
+| Endpoint              | Method | Description                         |
+|-----------------------|--------|-------------------------------------|
+| `/`                   | GET    | Main monitoring dashboard           |
+| `/video_feed/0`       | GET    | Camera 0 live MJPEG stream          |
+| `/video_feed/1`       | GET    | Camera 1 live MJPEG stream          |
+| `/api/cracks`         | GET    | JSON list of all detected defects   |
+| `/generate_report`    | GET    | Generate and download PDF report    |
+| `/crack_image/<id>`   | GET    | Retrieve a saved crack image by ID  |
+
+---
+
+## Detection Modes
+
+### On-Device AI (YOLOv11n)
+
+- Operates entirely offline — no internet connection required
+- Model: YOLOv11n, 68% mAP, approximately 5.5 MB
+- Real-time inference on Raspberry Pi 5 at 15-20 FPS
+- Supports CPU, Apple Silicon (MPS), and CUDA targets
+
+### Cloud-Based AI (Roboflow API)
+
+- Requires internet access and a valid Roboflow API key
+- Server-side inference with automatic model versioning
+- Typical latency: 150-300 ms per frame
+
+---
+
+## Performance Summary
+
+| Metric              | On-Device (Pi 5) | Cloud (Roboflow) |
+|---------------------|------------------|------------------|
+| Inference Speed     | 15-20 FPS        | 10-15 FPS        |
+| Latency             | 50-70 ms         | 150-300 ms       |
+| Accuracy (mAP)      | 68%              | Varies by model  |
+| Internet Required   | No               | Yes              |
+| Estimated Power Draw| 5-8 W            | 3-5 W            |
+
+---
+
+## Project Structure
+
+```
+Crack_App/
+├── realtime_pi5_dual_web.py       # Main application — Raspberry Pi 5
+├── realtime_pi4_optimized_web.py  # Main application — Raspberry Pi 4
+├── requirements.txt               # Python package dependencies
+├── .env.example                   # Environment configuration template
+├── .python-version                # Python version pin (3.11)
+├── Dockerfile.pi5                 # Docker image for Raspberry Pi 5
+├── Dockerfile.pi4                 # Docker image for Raspberry Pi 4
+├── models/
+│   └── best.pt                    # Trained YOLOv11n model (offline mode)
+└── data/                          # Runtime output (generated at startup)
+    └── realtime_results/
+        ├── reports/               # PDF and CSV inspection reports
+        ├── cam0_found/            # Crack images from Camera 0
+        └── cam1_found/            # Crack images from Camera 1
+```
+
+---
+
+## Troubleshooting
+
+### Camera Not Detected
+
 ```bash
-# Check camera detection
+# List available cameras
 libcamera-hello --list-cameras
 
-# Test camera capture
+# Test a single capture
 libcamera-jpeg -o test.jpg --camera 0
 ```
 
-### Model Loading Errors
-```bash
-# Verify model exists
-ls -lh models/best.pt
+### Model File Missing
 
-# Test model inference
-python test_offline_mode.py
+```bash
+# Verify the model file is present
+ls -lh models/best.pt
 ```
 
 ### Port Already in Use
+
 ```bash
-# Find process using port 5000
+# Identify the process occupying port 5000
 lsof -i :5000
 
-# Kill the process
+# Terminate it
 kill -9 <PID>
 ```
 
-### Python Version Issues
-```bash
-# Check Python version (requires 3.9-3.13)
-python --version
+### Insufficient Memory on Raspberry Pi 4
 
-# Use specific version
-python3.11 -m venv venv
-```
-
-### Memory Errors on Raspberry Pi
 ```bash
-# Increase swap space
+# Increase swap space to 2 GB
 sudo dphys-swapfile swapoff
-sudo nano /etc/dphys-swapfile  # Set CONF_SWAPSIZE=2048
+sudo sed -i 's/CONF_SWAPSIZE=.*/CONF_SWAPSIZE=2048/' /etc/dphys-swapfile
 sudo dphys-swapfile setup
 sudo dphys-swapfile swapon
 ```
 
 ---
 
-## 📊 Performance Metrics
+## License
 
-| Metric | On-Device (Pi 5) | Cloud-Based |
-|--------|------------------|-------------|
-| **Inference Speed** | ~15-20 FPS | ~10-15 FPS |
-| **Latency** | 50-70ms | 150-300ms |
-| **Accuracy (mAP)** | 68% | Varies |
-| **Internet Required** | ❌ No | ✅ Yes |
-| **Power Consumption** | 5-8W | 3-5W |
-| **Model Updates** | Manual | Automatic |
+This project is released under the MIT License. See the [LICENSE](LICENSE) file for details.
 
 ---
 
-## 🛠️ Development
+## Authors
 
-### Running Tests
+**Final Year Engineering Project — University of Nicosia, 2026**
 
-```bash
-# Smoke test (system validation)
-python smoke_test.py
-
-# Offline mode test
-python test_offline_mode.py
-
-# Camera test
-python realtime_pi5_dual.py
-```
-
-### Contributing
-
-1. Fork the repository
-2. Create a feature branch: `git checkout -b feature-name`
-3. Commit changes: `git commit -am 'Add feature'`
-4. Push to branch: `git push origin feature-name`
-5. Submit a pull request
+Shayan Naghashpour Shoushtari
+Contact: nshayan81@hotmail.com
 
 ---
 
-## 📚 Documentation
+## Acknowledgments
 
-- [Model Deployment Guide](DEPLOY_MODEL.md)
-- [Operator Manual](OPERATOR_GUIDE.md)
-- [Architecture Overview](ARCHITECTURE_DIAGRAM.txt)
-- [Integration Summary](INTEGRATION_SUMMARY.md)
-- [Offline Mode Setup](OFFLINE_MODEL_SETUP.md)
-
----
-
-## 📝 License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
----
-
-## 👥 Authors
-
-**Final Year Project 2026**
-- Department of Engineering University of Nicosia
-- Shayan NaghashpourShoushtari
-
----
-
-## 🙏 Acknowledgments
-
-- **Ultralytics YOLOv11** - Object detection framework
-- **Roboflow** - Cloud-based computer vision platform
-- **Raspberry Pi Foundation** - Hardware platform
-- **Flask** - Web framework
-- **OpenCV** - Computer vision library
-
----
-
-## 📞 Support
-
-For issues, questions, or contributions:
-- 📧 Email: [nshayan81@hotmail.com]
-
-
----
-
-<div align="center">
-
-**Built with ❤️ for industrial automation and AI-powered inspection**
-
-[⬆ Back to top](#automated-pipeline-inspection-system)
-
-</div>
+- Ultralytics — YOLOv11 object detection framework
+- Roboflow — Cloud computer vision platform
+- Raspberry Pi Foundation — Hardware platform
+- Flask — Lightweight Python web framework
+- OpenCV — Open-source computer vision library
